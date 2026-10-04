@@ -126,8 +126,10 @@ The window has three panels, and the dividers between them can be dragged:
   remove it. Right-click a row to open or copy the link, count again, move it
   to the top or bottom, or remove it. Each row shows how many videos the
   channel or playlist has; the program counts them in the background when a
-  link is added, and again once a day, and a large channel takes a minute or so.
-  Ticks are kept when the program closes.
+  link is added, and again once a day, five links at a time, and a large
+  channel takes a minute or so. Once a link has run, its row shows how many of
+  those are done (`70/74 videos`), and the running link counts up as its videos
+  download. Ticks are kept when the program closes.
 - **Channel pictures:** a YouTube link shows its channel's picture beside it
   (for a playlist or a video, the picture of the channel it is from; hover over
   it for the channel's name). They are fetched in the background, a few seconds
@@ -212,8 +214,10 @@ when you press **Download and fingerprint**, it asks whether to continue:
   `.pklz` files are thrown away, so none of it ends up in your fingerprints
   twice.
 
-Answering **No** forgets where it stopped; your list stays as it is. Turn the
-question off in Settings, General.
+Answering **No** forgets where it stopped; your list stays as it is.
+**Cancel** (or Esc, or closing the question) starts nothing and forgets
+nothing: it is asked again at the next **Download and fingerprint**, or the
+next time the program starts. Turn the question off in Settings, General.
 
 ### Running a channel again
 
@@ -294,6 +298,7 @@ The program always works from its own folder: `audfprint\`, `tools\` and
 | General | Offer to continue an unfinished list | On | See [Continuing an unfinished list](#continuing-an-unfinished-list). |
 | General | Remove links from the list once fingerprinted | Off | A link leaves the list as soon as all of it has been fingerprinted. Links that failed, were skipped or stopped, or where some downloads or batches failed in a way that may work next time (a network error, a rate limit), stay, so you can run them again. A private or removed video does not keep a link in the list. |
 | General | Keep yt-dlp up to date | On | Once a day, when the program starts, it looks for a newer yt-dlp and installs it. Sites change often, and an old yt-dlp is the commonest reason downloads fail. |
+| General | Tell me when a new Fingerprinter is out | On | When the program starts, it asks GitHub whether a newer Fingerprinter has been released (a newer beta too, while you use a beta). If so, the status bar says "Fingerprinter X is out"; click it to open the release page, whose notes say how to update. Nothing is downloaded or installed. |
 | General | Show channel pictures in the list | On | For YouTube links, the channel's picture beside the link, fetched from YouTube once a month and kept in `avatars\`. The pictures go the way yt-dlp goes: through its proxy, whether that is set in Extra download options or in yt-dlp's own config file. yt-dlp can use a SOCKS proxy but the picture downloads cannot, so with one nothing is fetched, and the console says so. Off, nothing is fetched. |
 | General | When a job finishes | Do nothing | **Sleep** or **Shut down** once a list or Audio on disk has run to its end (not after Stop), after a minute in which you can still say no. Back to Do nothing each time the program starts, so a choice made for one night does not stay. |
 | General | Put a shortcut on the desktop | (a button) | A Fingerprinter shortcut with its icon, on the desktop, for this copy of the program. Another copy's shortcut there is not replaced: this one is then called `Fingerprinter 2`. |
@@ -371,7 +376,7 @@ Press **Check setup** first. It:
 | "YouTube asked to confirm you are not a bot" | YouTube is refusing this PC for a while. Choose your browser under **Sign in with cookies from** (Settings, Downloads), lower **Downloads at once**, or wait. |
 | "yt-dlp may be out of date" | A site changed and this yt-dlp has not caught up. Once the job has finished, press **Check setup** to update it, then run the link again. |
 | "audfprint could not read ..." | That file is damaged or cut off. It is left out of the fingerprints and not remembered as done, and its link counts as incomplete, so running the link again downloads it again. |
-| Some items are skipped | Private, members-only, age-restricted or blocked in your country. The console gives the reason for each. |
+| Some items are skipped | Private, members-only, age-restricted or blocked in your country. The console gives the reason for each, with yt-dlp's own error and up to three of its warnings under it. |
 | The downloaded audio is gone | Expected: it is deleted once a link is fingerprinted. Turn on **Keep downloaded audio** in Settings, Folders, to keep it. |
 | A run seems frozen | Big channels take a while to list; **Now** shows how many entries have been found so far. For more detail, turn on **Show every line of download output** (Settings, Downloads). |
 

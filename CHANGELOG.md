@@ -3,6 +3,47 @@
 Versions follow [semantic versioning](https://semver.org/). Pre-releases
 (`-beta.N`) are for testing and may still change.
 
+## [1.0.0-beta.8] - 2026-10-04
+
+### Added
+
+- **How far each link has got, in the list**: the running link counts up as
+  its videos download ("27/74 videos"), and after a run each link shows how
+  many of its videos are done: fingerprinted in its last full run, left out by
+  the length limits, or, with **Skip items already fingerprinted in an earlier
+  run** on, fingerprinted before. A run stopped or skipped before its
+  fingerprints were made keeps the count from before. A channel that has
+  grown since shows its new videos as not done yet. Hover for what the numbers
+  mean.
+- **It tells you when a new Fingerprinter is out**: at start it asks GitHub
+  for the newest release (betas too, while you use a beta) and, when there is
+  a newer one, says so in the console and with a link in the status bar that
+  opens its release page. Nothing is downloaded or installed. **Tell me when a
+  new Fingerprinter is out** (Settings, General) turns it off.
+- **Cancel in "Continue the unfinished list?"**: it starts nothing and
+  forgets nothing; the question comes again at the next Download and
+  fingerprint, or the next time the program starts. Esc and the question's X
+  now do the same (before, it had only Yes and No and could not be closed any
+  other way).
+
+### Changed
+
+- **A failed download says what yt-dlp said**: with the short reason ("no
+  audio format available") the console now shows yt-dlp's own error and up to
+  three of its warnings for that video, which usually name the real cause.
+  yt-dlp's numbered retries count as one warning.
+- **Five links are counted at a time** in the background, instead of two. The
+  link that is running is not counted on the side: its run lists it anyway.
+- Quitting while links are being counted no longer freezes the window for a
+  few seconds.
+
+### Fixed
+
+- **A click beside a link in the list** opened the link in the browser: the
+  link reached across the empty part of the row. Now only the link itself
+  does, and a click beside it selects the row.
+- The Settings window could run off the bottom of a small screen.
+
 ## [1.0.0-beta.7] - 2026-09-28
 
 ### Added
@@ -379,6 +420,7 @@ does not work, with the console output from **Check setup**.
 
 - A value typed into Downloads at once above the maximum is capped at 32.
 
+[1.0.0-beta.8]: https://github.com/EierkuchenHD/fingerprinter/releases/tag/v1.0.0-beta.8
 [1.0.0-beta.7]: https://github.com/EierkuchenHD/fingerprinter/releases/tag/v1.0.0-beta.7
 [1.0.0-beta.6]: https://github.com/EierkuchenHD/fingerprinter/releases/tag/v1.0.0-beta.6
 [1.0.0-beta.5]: https://github.com/EierkuchenHD/fingerprinter/releases/tag/v1.0.0-beta.5

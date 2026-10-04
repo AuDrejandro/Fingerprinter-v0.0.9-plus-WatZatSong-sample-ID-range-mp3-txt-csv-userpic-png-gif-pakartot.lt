@@ -461,10 +461,59 @@ def _download(url: str, dest: Path, log: Log, label: str) -> None:
         raise OSError(f"download incomplete ({done:,} of {total:,} bytes)")
 
 
-def _fetch_text(url: str) -> str:
+def _fetch_text(url: str, timeout: int = 60) -> str:
     request = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT})
-    with urllib.request.urlopen(request, timeout=60) as response:
+    with urllib.request.urlopen(request, timeout=timeout) as response:
         return response.read().decode("utf-8", errors="replace")
+
+
+# The Fingerprinter's own releases. The list rather than /releases/latest,
+# which leaves pre-releases out, and every beta is one.
+RELEASES_API = "https://api.github.com/repos/EierkuchenHD/fingerprinter/releases?per_page=30"
+RELEASES_PAGE = "https://github.com/EierkuchenHD/fingerprinter/releases"
+
+
+def version_key(version: str) -> tuple | None:
+    """A sort key for "1.0.0-beta.8" / "v1.0.0", in semantic-versioning order:
+    1.0.0-beta.2 < 1.0.0-beta.10 < 1.0.0-rc.1 < 1.0.0 < 1.0.1. None for
+    anything else."""
+    m = re.match(r"^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$",
+                 version.strip())
+    if not m:
+        return None
+    major, minor, patch, pre = m.groups()
+    # A release sorts after all of its pre-releases; within a pre-release,
+    # numbers compare as numbers and come before words.
+    tail = (1,) if pre is None else (0, tuple((0, int(p), "") if p.isdigit() else (1, 0, p)
+                                              for p in pre.split(".")))
+    return (int(major), int(minor), int(patch), *tail)
+
+
+def newer_release(current: str, timeout: int = 15) -> dict | None:
+    """The newest release on GitHub when it is newer than `current`:
+    {"version", "url", "prerelease"}; None when there is none, or GitHub
+    cannot be reached. Running a beta, betas count; running a release, only
+    releases do. Drafts never."""
+    mine = version_key(current)
+    if mine is None:
+        return None
+    try:
+        releases = json.loads(_fetch_text(RELEASES_API, timeout=timeout))
+    except Exception:  # noqa: BLE001 - offline, blocked, rate-limited or an odd reply
+        return None
+    best, best_key = None, mine
+    for rel in releases if isinstance(releases, list) else []:
+        if not isinstance(rel, dict) or rel.get("draft"):
+            continue
+        if rel.get("prerelease") and len(mine) == 4:    # running a release
+            continue
+        key = version_key(str(rel.get("tag_name") or ""))
+        if key is not None and key > best_key:
+            best_key = key
+            best = {"version": str(rel["tag_name"]).lstrip("v"),
+                    "url": str(rel.get("html_url") or RELEASES_PAGE),
+                    "prerelease": bool(rel.get("prerelease"))}
+    return best
 
 
 def _sha256(path: Path) -> str:
