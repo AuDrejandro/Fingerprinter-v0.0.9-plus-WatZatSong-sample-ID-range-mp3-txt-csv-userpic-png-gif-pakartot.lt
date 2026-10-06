@@ -3,6 +3,47 @@
 Versions follow [semantic versioning](https://semver.org/). Pre-releases
 (`-beta.N`) are for testing and may still change.
 
+## [1.0.0-beta.9] - 2026-10-06
+
+### Changed
+
+- **Settings opens where you last left it**, also after a restart, instead
+  of always at the same place over the main window. Where it would not fit
+  on the screen in full there (pushed partly past an edge, or a smaller
+  screen than last time), it is moved just enough; if that place is on no
+  screen any more (a second monitor unplugged), it opens over the main
+  window as before.
+- **Questions and messages are dark in dark mode**: Windows draws its own
+  message boxes light whatever the program looks like, so in dark mode the
+  program now draws them itself, with a dark title bar. They work as before:
+  Enter, Y and N, Esc where there is a Cancel, Ctrl+C to copy the text. In
+  light mode they are still Windows' own. **Select what to download** is
+  dark too now. The windows for picking a file or folder are Windows' own
+  and stay as Windows draws them.
+
+### Fixed
+
+- **"No audio format available" on YouTube videos that do have sound**: when
+  YouTube offers no audio-only format, the sound is now copied out of its
+  360p video (format 18) into an .m4a, without re-encoding, instead of the
+  video being skipped. That happens:
+  - on age-restricted videos when the account signed in with (Sign in with
+    cookies from) is not age-verified;
+  - now and then on any video, while YouTube's player for signed-in users
+    answers "The page needs to be reloaded".
+
+  The console says so for each video it happens to. A video with no sound at
+  all is still skipped. Audio-only downloads are kept as they were, except
+  that one that comes as an .mp4 (YouTube live recordings, some other sites)
+  is now saved as .m4a, with the same sound.
+- When an age-restricted video still fails that way, the reason says so,
+  "age-restricted (account not age-verified)", with what to do about it.
+- A download that failed after writing its file (for example when its sound
+  could not be converted) left that file in the link's folder, where it was
+  fingerprinted with the rest; when it could not be read, none of the link's
+  items were remembered as fingerprinted. What a failed download wrote is
+  now deleted.
+
 ## [1.0.0-beta.8] - 2026-10-04
 
 ### Added
@@ -420,6 +461,7 @@ does not work, with the console output from **Check setup**.
 
 - A value typed into Downloads at once above the maximum is capped at 32.
 
+[1.0.0-beta.9]: https://github.com/EierkuchenHD/fingerprinter/releases/tag/v1.0.0-beta.9
 [1.0.0-beta.8]: https://github.com/EierkuchenHD/fingerprinter/releases/tag/v1.0.0-beta.8
 [1.0.0-beta.7]: https://github.com/EierkuchenHD/fingerprinter/releases/tag/v1.0.0-beta.7
 [1.0.0-beta.6]: https://github.com/EierkuchenHD/fingerprinter/releases/tag/v1.0.0-beta.6

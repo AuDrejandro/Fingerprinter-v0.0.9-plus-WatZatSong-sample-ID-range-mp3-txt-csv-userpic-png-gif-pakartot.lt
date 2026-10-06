@@ -287,11 +287,12 @@ HTTP 429 (too many requests) or 403, lower it.
 ![The Settings window](screenshot-settings.png)
 
 The program always works from its own folder: `audfprint\`, `tools\` and
-`work\` are the ones next to `yt-fingerprinter.pyw`.
+`work\` are the ones next to `yt-fingerprinter.pyw`. The window opens where
+you last left it.
 
 | Tab | Setting | Default | What it does |
 |---|---|---|---|
-| General | Appearance | Follow Windows | Light or Dark. Follow Windows goes dark when Windows apps are set to dark (Windows Settings, Personalisation, Colours), and switches along with it while the program runs. |
+| General | Appearance | Follow Windows | Light or Dark. Follow Windows goes dark when Windows apps are set to dark (Windows Settings, Personalisation, Colours), and switches along with it while the program runs. Questions and messages go dark with it; the windows for picking a file or folder are Windows' own and stay as Windows draws them. |
 | General | Console text size | 9 | Ctrl and the mouse wheel over the console change it too. |
 | General | Keep the PC awake while a job runs | On | Windows does not go to sleep until the job has finished. The screen can still turn off. |
 | General | Ask before Stop | On | |
@@ -377,6 +378,7 @@ Press **Check setup** first. It:
 | "yt-dlp may be out of date" | A site changed and this yt-dlp has not caught up. Once the job has finished, press **Check setup** to update it, then run the link again. |
 | "audfprint could not read ..." | That file is damaged or cut off. It is left out of the fingerprints and not remembered as done, and its link counts as incomplete, so running the link again downloads it again. |
 | Some items are skipped | Private, members-only, age-restricted or blocked in your country. The console gives the reason for each, with yt-dlp's own error and up to three of its warnings under it. |
+| "its sound was copied out of the video" | YouTube offered no audio-only format for that video, so the sound was taken from its 360p video instead. That is plenty for fingerprinting. On age-restricted videos it means the Google account you sign in with is not age-verified. |
 | The downloaded audio is gone | Expected: it is deleted once a link is fingerprinted. Turn on **Keep downloaded audio** in Settings, Folders, to keep it. |
 | A run seems frozen | Big channels take a while to list; **Now** shows how many entries have been found so far. For more detail, turn on **Show every line of download output** (Settings, Downloads). |
 

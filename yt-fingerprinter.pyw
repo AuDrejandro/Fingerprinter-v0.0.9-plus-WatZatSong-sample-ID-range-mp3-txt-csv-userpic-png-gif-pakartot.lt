@@ -66,7 +66,7 @@ try:
 except ImportError:  # pragma: no cover - Check setup offers to install it
     psutil = None
 
-__version__ = "1.0.0-beta.8"
+__version__ = "1.0.0-beta.9"
 
 
 # ---------------------------- helpers -----------------------------------------
@@ -492,6 +492,184 @@ class Tooltip:
             self._tip = None
 
 
+class MessageBox:
+    """showinfo, showwarning, showerror, askyesno and askyesnocancel, as in
+    tkinter.messagebox, in the program's colours. Windows draws its own boxes
+    light whatever the program looks like, so while it is dark they are drawn
+    here; light keeps Windows' own. They behave as Windows' do: modal over
+    their parent, the default button focused, Enter for the focused button,
+    Y and N for Yes and No, Esc and the X only where there is a Cancel or
+    just OK, Ctrl+C to copy the text, and the same sounds."""
+
+    # Set by the app from the current theme (see _apply_theme): the dark
+    # palette, or None for Windows' own boxes.
+    palette: dict | None = None
+
+    @classmethod
+    def showinfo(cls, title: str, message: str, **options: object) -> str:
+        if cls.palette is None:
+            return messagebox.showinfo(title, message, **options)
+        return cls._show(title, message, "info", ("ok",), options)
+
+    @classmethod
+    def showwarning(cls, title: str, message: str, **options: object) -> str:
+        if cls.palette is None:
+            return messagebox.showwarning(title, message, **options)
+        return cls._show(title, message, "warning", ("ok",), options)
+
+    @classmethod
+    def showerror(cls, title: str, message: str, **options: object) -> str:
+        if cls.palette is None:
+            return messagebox.showerror(title, message, **options)
+        return cls._show(title, message, "error", ("ok",), options)
+
+    @classmethod
+    def askyesno(cls, title: str, message: str, **options: object) -> bool:
+        if cls.palette is None:
+            return messagebox.askyesno(title, message, **options)
+        return cls._show(title, message, "question", ("yes", "no"), options) == "yes"
+
+    @classmethod
+    def askyesnocancel(cls, title: str, message: str, **options: object) -> bool | None:
+        if cls.palette is None:
+            return messagebox.askyesnocancel(title, message, **options)
+        answer = cls._show(title, message, "question", ("yes", "no", "cancel"), options)
+        return None if answer == "cancel" else answer == "yes"
+
+    LABELS = {"ok": "OK", "yes": "Yes", "no": "No", "cancel": "Cancel"}
+    # Windows' sounds for them; a question has none.
+    SOUNDS = {"info": 0x40, "warning": 0x30, "error": 0x10}
+
+    @classmethod
+    def _show(cls, title: str, message: str, icon: str, buttons: tuple[str, ...],
+              options: dict) -> str:
+        p = cls.palette or PALETTES["dark"]
+        icon = str(options.get("icon") or icon)
+        default = str(options.get("default") or buttons[0])
+        if default not in buttons:
+            default = buttons[0]
+        parent = options.get("parent")
+        owner = (parent if isinstance(parent, tk.Misc) else tk._get_default_root()).winfo_toplevel()
+        # Where Esc and the X go: nowhere for Yes/No, as in Windows' own.
+        closes = "cancel" if "cancel" in buttons else "ok" if buttons == ("ok",) else None
+        answer = [closes or buttons[-1]]       # if it is destroyed from outside
+
+        dlg = tk.Toplevel(owner, bg=p["bg"])
+        dlg.withdraw()
+        dlg.title(title)
+        dlg.resizable(False, False)
+        # Not over a hidden or minimised window: it would be hidden with it.
+        if owner.winfo_viewable():
+            dlg.transient(owner)
+
+        def finish(name: str) -> None:
+            answer[0] = name
+            dlg.destroy()
+
+        body = ttk.Frame(dlg, padding=(18, 18, 18, 14))
+        body.pack(fill="both", expand=True)
+        size = round(24 * float(dlg.tk.call("tk", "scaling")))   # 32 pixels at 100%
+        mark = tk.Canvas(body, width=size, height=size, bg=p["bg"], highlightthickness=0)
+        mark.pack(side="left", anchor="n", padx=(0, 14))
+        colour = {"warning": p["tags"]["bat"], "error": p["warn"]}.get(icon, p["link"])
+        if icon == "warning":
+            mark.create_polygon(size / 2, 1, size - 1, size - 2, 1, size - 2, fill=colour, outline=colour)
+        else:
+            mark.create_oval(1, 1, size - 1, size - 1, fill=colour, outline=colour)
+        glyph = {"warning": "!", "error": "✕", "question": "?"}.get(icon, "i")
+        mark.create_text(size / 2, size * (0.6 if icon == "warning" else 0.5), text=glyph, fill=p["bg"],
+                         font=("Segoe UI", -round(size * 0.55), "bold"))
+        ttk.Label(body, text=message, justify="left", wraplength=520).pack(side="left", anchor="w")
+
+        # Made in the order they are shown, which Tab and the arrows follow.
+        row = ttk.Frame(dlg, padding=(18, 0, 18, 14))
+        row.pack(fill="x")
+        right = ttk.Frame(row)
+        right.pack(side="right")
+        widgets: dict[str, ttk.Button] = {}
+        for name in buttons:
+            widgets[name] = ttk.Button(right, text=cls.LABELS[name], width=10, command=lambda n=name: finish(n),
+                                       default="active" if name == default else "normal")
+            widgets[name].pack(side="left", padx=(6, 0))
+
+        def press(_e: tk.Event) -> str:
+            focus = dlg.focus_get()
+            (focus if isinstance(focus, ttk.Button) else widgets[default]).invoke()
+            return "break"
+        for key in ("<Return>", "<KP_Enter>"):
+            dlg.bind(key, press)
+        for name, key in (("yes", "y"), ("no", "n")):
+            if name in buttons:
+                for k in (key, key.upper()):
+                    dlg.bind(f"<KeyPress-{k}>", lambda _e, n=name: finish(n))
+        def move(e: tk.Event, step: str) -> None:
+            if isinstance(e.widget, ttk.Button) and (to := getattr(e.widget, step)()) is not None:
+                to.focus_set()
+        for key, step in (("<Left>", "tk_focusPrev"), ("<Right>", "tk_focusNext")):
+            dlg.bind(key, lambda e, s=step: move(e, s))
+        if closes:
+            dlg.bind("<Escape>", lambda _e: finish(closes))
+        dlg.protocol("WM_DELETE_WINDOW", (lambda: finish(closes)) if closes else (lambda: None))
+
+        def copy(_e: tk.Event) -> None:
+            line = "-" * 27
+            dlg.clipboard_clear()
+            dlg.clipboard_append(f"{line}\n{title}\n{line}\n{message}\n{line}\n"
+                                 + "   ".join(cls.LABELS[b] for b in buttons) + f"\n{line}\n")
+        for key in ("<Control-c>", "<Control-C>"):
+            dlg.bind(key, copy)
+        # A title bar can only be made dark once the window has its frame.
+        dlg.bind("<Map>", lambda e: e.widget is dlg and FingerprinterApp._dark_title_bar(dlg, True), add="+")
+
+        # Over the middle of its parent, as Windows places its own, and on
+        # the screen in full.
+        dlg.update_idletasks()
+        w, h = dlg.winfo_reqwidth(), dlg.winfo_reqheight()
+        if owner.winfo_viewable():
+            cx = owner.winfo_rootx() + owner.winfo_width() // 2
+            cy = owner.winfo_rooty() + owner.winfo_height() // 2
+        else:
+            cx, cy = dlg.winfo_screenwidth() // 2, dlg.winfo_screenheight() // 2
+        x, y = cx - w // 2, cy - h // 2
+        # The monitor nearest the parent's middle: a main window dragged half
+        # off the screen has its middle on none, and the box would be too.
+        area = FingerprinterApp._screen_area(cx, cy, nearest=True)
+        if area:
+            left, top, right, bottom = area
+            x, y = max(left, min(x, right - w - 16)), max(top, min(y, bottom - h - 40))
+        dlg.geometry(f"+{x}+{y}")
+        # Where the keyboard was, and a dialog under it that held the grab:
+        # both go back there when it closes, as with Tk's own dialogs.
+        try:
+            focus_before = dlg.focus_get()
+        except KeyError:                    # a focus Tkinter cannot name
+            focus_before = None
+        held = dlg.grab_current()
+        dlg.deiconify()
+        dlg.lift()
+        widgets[default].focus_set()
+        try:
+            dlg.wait_visibility()
+            dlg.grab_set()
+        except tk.TclError:
+            pass
+        if (sound := cls.SOUNDS.get(icon)) is not None and sys.platform == "win32":
+            try:
+                import winsound
+                winsound.MessageBeep(sound)
+            except Exception:  # noqa: BLE001 - a box without its sound is fine
+                pass
+        dlg.wait_window()
+        try:
+            if held is not None and held.winfo_exists():
+                held.grab_set()
+            if focus_before is not None and focus_before.winfo_exists():
+                focus_before.focus_set()
+        except tk.TclError:
+            pass
+        return answer[0]
+
+
 # ---------------------------- main app ----------------------------------------
 
 class FingerprinterApp:
@@ -586,6 +764,8 @@ class FingerprinterApp:
         self._power_action_due = False
         # The main window's size and place while not maximised (_note_geometry).
         self._normal_geometry = ""
+        # Where Settings was last, (x, y), to open there again (_show_settings).
+        self._settings_pos: tuple[int, int] | None = None
         # When yt-dlp was last checked for a newer release at start
         # (_update_ytdlp_at_start), as YYYY-MM-DD.
         self._ytdlp_checked = ""
@@ -1126,6 +1306,8 @@ class FingerprinterApp:
         self.settings_win.transient(self.root)
         self.settings_win.resizable(False, False)
         self.settings_win.protocol("WM_DELETE_WINDOW", self._hide_settings)
+        # Its place as it is moved, so it opens there again (_show_settings).
+        self.settings_win.bind("<Configure>", self._note_settings_place, add="+")
         self.settings_win.withdraw()
         self.settings_tabs = ttk.Notebook(self.settings_win)
         self.settings_tabs.pack(fill="both", expand=True, padx=8, pady=(8, 0))
@@ -1448,22 +1630,55 @@ class FingerprinterApp:
         self._update_done_count()
         if tab is not None:
             self.settings_tabs.select(tab)
+        if self.settings_win.winfo_viewable():
+            self.settings_win.lift()        # already open: it stays where it is
+            return
+        self.root.update_idletasks()
+        tall = self.settings_win.winfo_reqheight() + 40           # with the title bar
+        wide = self.settings_win.winfo_reqwidth() + 16
+        pos = self._settings_pos
+        # Where it was last, if any of it is still on a screen (a second
+        # monitor may have gone since), moved only as far as it takes to be
+        # on that screen in full: it may have been pushed past an edge, and a
+        # place kept from a bigger screen (a remote desktop window sized
+        # differently) would leave Close below the bottom.
+        area = self._screen_area(pos[0], pos[1], pos[0] + wide, pos[1] + tall) if pos else None
+        if pos and area:
+            left, top, right, bottom = area
+            x, y = max(left, min(pos[0], right - wide)), max(top, min(pos[1], bottom - tall))
+        else:
+            # The first time, over the main window rather than wherever
+            # Windows feels like, so it reads as belonging to the button that
+            # opened it; kept on the screen: the General tab is about 740
+            # pixels tall, and 80 below the window's top ran off a 768-pixel
+            # screen.
+            x = self.root.winfo_rootx() + 60
+            y = max(0, min(self.root.winfo_rooty() + 80, self.settings_win.winfo_screenheight() - tall - 48))
+        self.settings_win.geometry(f"+{x}+{y}")
         self.settings_win.deiconify()
         self.settings_win.lift()
-        # Over the main window rather than wherever Windows feels like, so it
-        # reads as belonging to the button that opened it.
-        self.root.update_idletasks()
-        # ...but kept on the screen: the General tab is about 740 pixels tall,
-        # and 80 below the window's top ran off a 768-pixel screen.
-        tall = self.settings_win.winfo_reqheight() + 40           # with the title bar
-        y = max(0, min(self.root.winfo_rooty() + 80, self.settings_win.winfo_screenheight() - tall - 48))
-        self.settings_win.geometry(f"+{self.root.winfo_rootx() + 60}+{y}")
+
+    def _settings_place(self) -> tuple[int, int] | None:
+        """Where Settings is now, (x, y), while it is open."""
+        try:
+            if not self.settings_win.winfo_viewable():
+                return None
+            m = re.fullmatch(r"\d+x\d+\+(-?\d+)\+(-?\d+)", self.settings_win.geometry())
+        except tk.TclError:
+            return None
+        return (int(m[1]), int(m[2])) if m else None
+
+    def _note_settings_place(self, event: tk.Event) -> None:
+        # <Configure> comes for every widget inside it as well.
+        if event.widget is self.settings_win:
+            self._settings_pos = self._settings_place() or self._settings_pos
 
     def _hide_settings(self) -> None:
         # Folders typed into the boxes are tidied when the window closes too.
         for var in (self.output_dir_var, self.bat_dir_var, self.move_pklz_dir_var,
                     self.keep_audio_dir_var):
             self._normalize_var(var)
+        self._settings_pos = self._settings_place() or self._settings_pos
         self.settings_win.withdraw()
 
     def _program_dir(self) -> Path:
@@ -1531,8 +1746,11 @@ class FingerprinterApp:
         return "dark" if self._windows_uses_dark() else "light"
 
     def _follow_windows_theme(self) -> None:
-        """While Appearance is Follow Windows, notice Windows changing over."""
-        if self.theme_var.get() == THEME_CHOICES[0] and self._theme_mode() != self._theme_now:
+        """While Appearance is Follow Windows, notice Windows changing over.
+        Not while a dialog is open (it holds the grab): one drawn dark would
+        turn half light, so the change waits until it has closed."""
+        if (self.theme_var.get() == THEME_CHOICES[0] and self._theme_mode() != self._theme_now
+                and self.root.grab_current() is None):
             self._apply_theme()
         self.root.after(10_000, self._follow_windows_theme)
 
@@ -1543,8 +1761,8 @@ class FingerprinterApp:
         dark uses clam, the one built-in theme that takes colours at all. The
         rest is coloured by hand from PALETTES: the rows of the list and Now,
         the console and its colour tags, borders, dividers, tooltips, and the
-        text colour of help lines and links. Message boxes are drawn by Windows
-        and stay light."""
+        text colour of help lines and links. Windows draws its message boxes
+        light, so while dark they are drawn by MessageBox."""
         mode = self._theme_mode()
         self._theme_now = mode
         p = PALETTES[mode]
@@ -1571,6 +1789,7 @@ class FingerprinterApp:
         for label, role in self._themed_labels:
             label.configure(foreground=p[role])
         Tooltip.colours = {"bg": p["tip_bg"], "fg": p["tip_fg"]}
+        MessageBox.palette = p if mode == "dark" else None
         self.disk_menu.configure(**self._menu_colours())
         for combo in (self.url_combo, self.cookies_combo, self.theme_combo, self.when_done_combo):
             self._style_combo_popdown(combo, p)
@@ -1590,7 +1809,7 @@ class FingerprinterApp:
         """A window's title bar can only be made dark once Windows has made
         the frame that draws it, when the window is first shown; setting it
         in _apply_theme before that does nothing. Hence again on every <Map>
-        (bound on the main window, Settings and the timed Yes/No box). The
+        (bound on the main window, Settings and the program's own dialogs). The
         main window's first also gives it its app ID (_set_window_app_id)."""
         window = event.widget
         if isinstance(window, (tk.Tk, tk.Toplevel)):
@@ -1984,7 +2203,7 @@ class FingerprinterApp:
                 continue
             path = Path(value).resolve()
             if path == work or work in path.parents:
-                messagebox.showerror(
+                MessageBox.showerror(
                     "Pick another folder",
                     f"{label} is inside the program's work folder:\n{path}\n\n"
                     f"That folder is emptied during runs. Choose a different one.",
@@ -1998,7 +2217,7 @@ class FingerprinterApp:
                 # A folder per channel would land among the program's own
                 # (a channel called Tools or Work), and uninstall.bat would
                 # take it for one of them.
-                messagebox.showerror(
+                MessageBox.showerror(
                     "Pick another folder",
                     "Keep downloaded audio in is the program folder itself. Choose a folder "
                     "inside it, like the default audio, or one elsewhere.",
@@ -2006,7 +2225,7 @@ class FingerprinterApp:
                 )
                 return True
             if kept == work or work in kept.parents or kept == working or working in kept.parents:
-                messagebox.showerror(
+                MessageBox.showerror(
                     "Pick another folder",
                     f"Keep downloaded audio in is inside the working folder or the "
                     f"program's work folder:\n{kept}\n\nAudio in those is deleted during "
@@ -2221,7 +2440,7 @@ class FingerprinterApp:
         try:
             Path(path).write_bytes(data)
         except OSError as e:
-            messagebox.showerror("Could not save", f"The console could not be saved:\n{e}", parent=self.root)
+            MessageBox.showerror("Could not save", f"The console could not be saved:\n{e}", parent=self.root)
             return
         self._log(f"[+] Console saved to {path}")
 
@@ -2339,6 +2558,10 @@ class FingerprinterApp:
                 setattr(self, attr, conv(0))
         self._ytdlp_checked = str(cfg.get("ytdlp_checked") or "")
         self._restore_window(cfg.get("window"))
+        pos = cfg.get("settings_window")
+        if (isinstance(pos, list) and len(pos) == 2
+                and all(isinstance(v, int) and not isinstance(v, bool) for v in pos)):
+            self._settings_pos = (pos[0], pos[1])
         # Restore the saved channel queue (crash recovery / persistence).
         saved_queue = cfg.get("queue")
         if isinstance(saved_queue, list):
@@ -2431,6 +2654,9 @@ class FingerprinterApp:
         window = self._window_config()
         if window:
             out["window"] = window
+        settings_pos = self._settings_place() or self._settings_pos
+        if settings_pos:
+            out["settings_window"] = list(settings_pos)
         if self._ytdlp_checked:
             out["ytdlp_checked"] = self._ytdlp_checked
         # Follow as the user left it: a search that turned it off meanwhile
@@ -2495,9 +2721,12 @@ class FingerprinterApp:
             self.root.after(0, lambda: self.root.state("zoomed"))
 
     @staticmethod
-    def _screen_area(x: int, y: int) -> tuple[int, int, int, int] | None:
+    def _screen_area(x: int, y: int, right: int | None = None, bottom: int | None = None,
+                     nearest: bool = False) -> tuple[int, int, int, int] | None:
         """The work area (left, top, right, bottom; without the taskbar) of the
-        monitor the point is on, or None when no monitor there is now."""
+        monitor the point is on, or None when no monitor there is now. With
+        `right` and `bottom`, of the monitor the rectangle from the point
+        overlaps most. `nearest`: the monitor nearest to it rather than None."""
         if sys.platform != "win32":
             return None
         try:
@@ -2510,8 +2739,13 @@ class FingerprinterApp:
 
             user32 = ctypes.windll.user32
             user32.MonitorFromPoint.restype = wintypes.HMONITOR
-            monitor_default_to_null = 0
-            monitor = user32.MonitorFromPoint(wintypes.POINT(x, y), monitor_default_to_null)
+            user32.MonitorFromRect.restype = wintypes.HMONITOR
+            flag = 2 if nearest else 0      # MONITOR_DEFAULTTONEAREST, ...TONULL
+            if right is None or bottom is None:
+                monitor = user32.MonitorFromPoint(wintypes.POINT(x, y), flag)
+            else:
+                rect = wintypes.RECT(x, y, right, bottom)
+                monitor = user32.MonitorFromRect(ctypes.byref(rect), flag)
             if not monitor:
                 return None
             info = MONITORINFO(cbSize=ctypes.sizeof(MONITORINFO))
@@ -2525,7 +2759,7 @@ class FingerprinterApp:
     def _on_close(self) -> None:
         """Persist settings, then exit. Confirm first if a worker is running."""
         if self.worker_thread is not None and self.worker_thread.is_alive():
-            confirm = messagebox.askyesno(
+            confirm = MessageBox.askyesno(
                 "Quit while running?",
                 "A job is still running.\n\n"
                 "Quitting stops it. yt-dlp or ffmpeg may take a few seconds to exit.\n\n"
@@ -2550,6 +2784,23 @@ class FingerprinterApp:
             self._set_window_app_id(False)
         self.root.destroy()
 
+    @staticmethod
+    def _grab_for(dlg: tk.Toplevel) -> None:
+        """Make `dlg` modal, and when it closes give the grab back to what
+        held it: a message box under it (MessageBox), which would otherwise
+        stay open with the main window taking clicks again."""
+        held = dlg.grab_current()
+        dlg.grab_set()
+
+        def give_back(event: tk.Event) -> None:
+            if event.widget is dlg and held is not None:
+                try:
+                    if held.winfo_exists():
+                        held.grab_set()
+                except tk.TclError:
+                    pass
+        dlg.bind("<Destroy>", give_back, add="+")
+
     def _ask_yes_no(self, title: str, message: str) -> bool:
         """Show a yes/no messagebox from a worker thread, blocking until answered."""
         result: list[bool] = [False]
@@ -2557,7 +2808,7 @@ class FingerprinterApp:
 
         def show() -> None:
             try:
-                result[0] = messagebox.askyesno(title, message, parent=self.root)
+                result[0] = MessageBox.askyesno(title, message, parent=self.root)
             finally:
                 done.set()
 
@@ -2612,7 +2863,7 @@ class FingerprinterApp:
                     value=f"Auto-{action_word} in {timeout_seconds // 60}:{timeout_seconds % 60:02d}..."
                 )
                 ttk.Label(
-                    msg_frame, textvariable=countdown_var, foreground="#888",
+                    msg_frame, textvariable=countdown_var, foreground=PALETTES[self._theme_now]["muted"],
                 ).pack(anchor="w", pady=(8, 0))
 
                 btn_frame = ttk.Frame(dlg, padding=(14, 0, 14, 14))
@@ -2648,7 +2899,7 @@ class FingerprinterApp:
                 rw, rh = self.root.winfo_width(), self.root.winfo_height()
                 dw, dh = dlg.winfo_width(), dlg.winfo_height()
                 dlg.geometry(f"+{rx + (rw - dw) // 2}+{ry + (rh - dh) // 2}")
-                dlg.grab_set()
+                self._grab_for(dlg)
             except Exception:
                 done.set()
 
@@ -2840,6 +3091,10 @@ class FingerprinterApp:
         "HTTP 429 rate-limited": "The site is limiting how fast you download (HTTP 429). Lower "
                                  "Downloads at once, or try again later.",
         "disk full": "The disk is full. Free some space, then run the link again.",
+        "age-restricted (account not age-verified)":
+            "YouTube gives age-restricted videos in full only to accounts it has verified the "
+            "age of. Verify the age of the Google account signed in to the browser under Sign "
+            "in with cookies from (Settings, Downloads), then run the link again.",
     }
 
     def _advise_on_failures(self) -> None:
@@ -2859,9 +3114,11 @@ class FingerprinterApp:
 
         def show() -> None:
             try:
-                dlg = tk.Toplevel(self.root)
+                p = PALETTES[self._theme_now]
+                dlg = tk.Toplevel(self.root, bg=p["bg"])
                 dlg.title(f"Select what to download ({len(entries)} found)")
                 dlg.transient(self.root)
+                dlg.bind("<Map>", self._on_map_title_bar, add="+")
                 dlg.geometry("760x560")
                 dlg.minsize(560, 400)
 
@@ -2890,7 +3147,7 @@ class FingerprinterApp:
                 filter_entry = ttk.Entry(filter_row, textvariable=filter_var)
                 filter_entry.pack(side="left", fill="x", expand=True)
                 count_var = tk.StringVar(value=f"{len(entries)} of {len(entries)} selected")
-                ttk.Label(filter_row, textvariable=count_var, foreground="#666").pack(
+                ttk.Label(filter_row, textvariable=count_var, foreground=p["muted"]).pack(
                     side="right", padx=(8, 0),
                 )
 
@@ -2902,7 +3159,7 @@ class FingerprinterApp:
                 list_frame = ttk.Frame(dlg, padding=(12, 0, 12, 0))
                 list_frame.pack(fill="both", expand=True)
 
-                canvas = tk.Canvas(list_frame, highlightthickness=0)
+                canvas = tk.Canvas(list_frame, highlightthickness=0, bg=p["bg"])
                 scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=canvas.yview)
                 inner = ttk.Frame(canvas)
                 inner_id = canvas.create_window((0, 0), window=inner, anchor="nw")
@@ -3015,7 +3272,7 @@ class FingerprinterApp:
                 rw, rh = self.root.winfo_width(), self.root.winfo_height()
                 dw, dh = dlg.winfo_width(), dlg.winfo_height()
                 dlg.geometry(f"+{rx + (rw - dw) // 2}+{ry + (rh - dh) // 2}")
-                dlg.grab_set()
+                self._grab_for(dlg)
             except Exception:
                 done.set()
 
@@ -3222,13 +3479,13 @@ class FingerprinterApp:
         try:
             os.startfile(str(DONE_FILE))  # type: ignore[attr-defined]
         except OSError as e:
-            messagebox.showerror("Could not open it", f"{DONE_FILE}\n\n{e}", parent=self.settings_win)
+            MessageBox.showerror("Could not open it", f"{DONE_FILE}\n\n{e}", parent=self.settings_win)
 
     def _forget_done(self) -> None:
         n = len(self._load_done())
         if not n:
             return
-        if not messagebox.askyesno(
+        if not MessageBox.askyesno(
             "Forget fingerprinted items?",
             f"Forget the {n:,} item(s) remembered as fingerprinted?\n\n"
             "The next run of each link then downloads and fingerprints everything "
@@ -3239,7 +3496,7 @@ class FingerprinterApp:
         try:
             DONE_FILE.unlink(missing_ok=True)
         except OSError as e:
-            messagebox.showerror("Could not forget them", str(e), parent=self.settings_win)
+            MessageBox.showerror("Could not forget them", str(e), parent=self.settings_win)
         self._update_done_count()
 
     def _notify_done(self) -> None:
@@ -3289,7 +3546,9 @@ class FingerprinterApp:
             return "downloaded", f"100% (in {m.group(1)})"
         if "[download] Destination:" in line:
             return "downloading", "starting..."
-        if "[ExtractAudio]" in line:
+        # Only Destination: every download prints an "[ExtractAudio] Not
+        # converting" line, as -x has nothing to do for audio-only files.
+        if "[ExtractAudio] Destination" in line:
             return "extracting", "extracting audio..."
         if "has already been downloaded" in line:
             return "skipped", "already on disk"
@@ -4492,7 +4751,7 @@ class FingerprinterApp:
         rather than seeming to ignore it. After the validation has returned,
         as Tk turns validation off if its callbacks do more."""
         self.root.bell()
-        self.root.after(0, lambda: messagebox.showinfo(
+        self.root.after(0, lambda: MessageBox.showinfo(
             "Too much for the link box",
             "That is too long to paste into the link box. For a long list of links, "
             "put them in a text file, one per line, and use Import.",
@@ -4540,7 +4799,7 @@ class FingerprinterApp:
             added.append(url)
 
         if not added and not dupes:
-            messagebox.showerror(
+            MessageBox.showerror(
                 "Invalid link",
                 "That doesn't look like a link.\n\n"
                 "Paste a link starting with https://, or a YouTube @handle. Several at "
@@ -4630,7 +4889,7 @@ class FingerprinterApp:
         try:
             raw = Path(path).read_text(encoding="utf-8-sig", errors="replace")
         except Exception as e:  # noqa: BLE001
-            messagebox.showerror("Could not read file", f"Failed to read:\n{path}\n\n{e}")
+            MessageBox.showerror("Could not read file", f"Failed to read:\n{path}\n\n{e}")
             return
 
         added = 0
@@ -4696,7 +4955,7 @@ class FingerprinterApp:
         n = len(indexes)
         if (n == len(self.queue_urls) and n > 1) or n > 5:
             every = "every link in the list" if n == len(self.queue_urls) else f"{n} links"
-            if not messagebox.askyesno(
+            if not MessageBox.askyesno(
                 f"Remove {how} links?",
                 f"Remove {every}? {n} of {len(self.queue_urls)} are {how}.\n\n"
                 "Undo in the status bar, or Ctrl+Z, puts them back.",
@@ -4780,7 +5039,7 @@ class FingerprinterApp:
     def _queue_clear(self) -> None:
         if not self.queue_urls:
             return
-        if not messagebox.askyesno("Clear the list", "Remove every link from the list?\n\n"
+        if not MessageBox.askyesno("Clear the list", "Remove every link from the list?\n\n"
                                    "Undo in the status bar, or Ctrl+Z, puts them back."):
             return
         self._remember_removal(list(range(len(self.queue_urls))))
@@ -4831,7 +5090,7 @@ class FingerprinterApp:
             checked_urls = list(resume["remaining"])
         else:
             if not self.queue_urls:
-                messagebox.showerror(
+                MessageBox.showerror(
                     "The list is empty",
                     "Add at least one link to the list first.",
                 )
@@ -4842,7 +5101,7 @@ class FingerprinterApp:
                 u for u, v in zip(self.queue_urls, self.queue_checks) if v.get()
             ]
             if not checked_urls:
-                messagebox.showerror(
+                MessageBox.showerror(
                     "Nothing ticked",
                     "Tick at least one link in the list.",
                 )
@@ -4852,7 +5111,7 @@ class FingerprinterApp:
         output_dir = self.output_dir_var.get()
         bat_dir = self.bat_dir_var.get()
         if not output_dir or not Path(output_dir).is_dir():
-            messagebox.showerror("Missing input", "Pick a valid working folder for audio.")
+            MessageBox.showerror("Missing input", "Pick a valid working folder for audio.")
             return
         if not self._audfprint_ready(bat_dir) or self._folders_clash(bat_dir):
             return
@@ -4896,7 +5155,7 @@ class FingerprinterApp:
         problem = dependencies.audfprint_problem(bat_dir)
         if problem is None:
             return True
-        messagebox.showerror(
+        MessageBox.showerror(
             "WerZatSong's audfprint is needed",
             f"audfprint: {problem}.\n\n"
             f"The Fingerprinter needs WerZatSong's version of audfprint "
@@ -5049,7 +5308,7 @@ class FingerprinterApp:
 
         source_dir = self.output_dir_var.get()
         if not source_dir or not Path(source_dir).is_dir():
-            messagebox.showerror("Missing input", "Pick a valid working folder to scan for audio.")
+            MessageBox.showerror("Missing input", "Pick a valid working folder to scan for audio.")
             return
 
         # Says that files get rewritten, because they do: splitting replaces a
@@ -5109,7 +5368,7 @@ class FingerprinterApp:
         open: the daily yt-dlp update at start (_update_ytdlp_at_start)."""
         if self.worker_thread is None or not self.worker_thread.is_alive():
             return False
-        messagebox.showinfo("Busy", "Another job is running (the status bar says which). "
+        MessageBox.showinfo("Busy", "Another job is running (the status bar says which). "
                                     "Start this one when it has finished.", parent=self.root)
         return True
 
@@ -5158,7 +5417,7 @@ class FingerprinterApp:
         dlg.geometry(f"+{max(0, x)}+{max(0, y)}")
         entry.focus_set()
         entry.select_range(0, "end")
-        dlg.grab_set()
+        self._grab_for(dlg)
         self.root.wait_window(dlg)
         return result[0]
 
@@ -5589,7 +5848,7 @@ class FingerprinterApp:
         done = sum(1 for u in links if u in state["finished"])
         stopped_in = state.get("current") or remaining[0]
         when = f" on {state['updated']}" if state.get("updated") else ""
-        answer = messagebox.askyesnocancel(
+        answer = MessageBox.askyesnocancel(
             "Continue the unfinished list?",
             f"The last run of your list stopped part-way{when}. {done} of {len(links)} "
             f"link(s) had finished, and it stopped in:\n{stopped_in}\n\n"
@@ -5725,7 +5984,7 @@ class FingerprinterApp:
                     "disk again carries on from them while the program stays open (after a "
                     f"restart too, with Write {self.FINGERPRINTED_RECORD} on).",
         }.get(self._job_kind, "")
-        if self.confirm_stop_var.get() and not messagebox.askyesno(
+        if self.confirm_stop_var.get() and not MessageBox.askyesno(
             "Stop the job?", "Stop everything that is running now?" + detail,
             icon="warning", default="no", parent=self.root,
         ):
@@ -7683,8 +7942,26 @@ class FingerprinterApp:
             "--no-playlist",
             "--ignore-errors",
             "--newline",  # one progress line per update instead of \r-rewriting
-            "-f", "bestaudio[ext=m4a]/bestaudio",
+            # The last two only when there is no audio-only format: YouTube
+            # then still offers its 360p mp4 with the sound in it (format 18).
+            # That happens on an age-restricted video when the account signed
+            # in with is not age-verified, and now and then on any video while
+            # YouTube's player clients for signed-in users misbehave; it used
+            # to fail as "Requested format is not available". Only formats
+            # known to have sound: a silent video would otherwise come as its
+            # video alone, fail in -x, and fail on every run.
+            "-f", ("bestaudio[ext=m4a]/bestaudio/best[ext=mp4][acodec!=none][height<=?480]"
+                   "/best[ext=mp4][acodec!=none]"),
             "--remux-video", "webm>opus",
+            # Copies the sound out of an mp4 into an .m4a and deletes the mp4;
+            # AAC, which is what YouTube and nearly every site put in an mp4,
+            # is copied as it is. Nothing else has a mapping here, so m4a,
+            # webm, mp3 and the rest are left as they were.
+            "-x", "--audio-format", "mp4>m4a",
+            # Whether the format picked has video in it, for the note below.
+            # Every audio-only .mp4 goes through -x as well. --print alone
+            # would make yt-dlp quiet, its progress lines included.
+            "--no-quiet", "--print", f"before_dl:{self.PICKED_MARK}%(vcodec)s",
         ]
         # Warnings are not switched off: an outdated yt-dlp says so only in a
         # warning (SOLVER_WARNINGS). The rest are not kept (see below).
@@ -7727,6 +8004,15 @@ class FingerprinterApp:
         # error itself only says "Requested format is not available". Keyed
         # without their numbers, so "Retrying (1/3)" ... "(3/3)" are one.
         warn_lines: dict[str, str] = {}
+        # yt-dlp says an age-restricted video needs an age-verified account
+        # only in a plain [youtube] line, not as a warning or an error.
+        age_verify = False
+        picked_video = False    # the format picked has video (see -f)
+        from_video = False      # and its sound was copied out of it
+        # What this download wrote, to delete if it fails: a file left
+        # behind was fingerprinted with the rest of the link, and as no item
+        # it belongs to was downloaded, none of the link's were remembered.
+        written: list[str] = []
         assert proc.stdout is not None
 
         # Ticker thread: ffmpeg runs silently during ExtractAudio, so without this
@@ -7763,8 +8049,15 @@ class FingerprinterApp:
                     self._log(f"  [s{slot + 1}] {line}", tag="ytdlp")
                 if "does not pass filter" in line:
                     entry["_left_out"] = True     # outside the length limits
-                if "[ExtractAudio]" in line and extract_start[0] is None:
-                    extract_start[0] = time.time()
+                if line.startswith(self.PICKED_MARK):
+                    picked_video = line[len(self.PICKED_MARK):].strip() not in ("none", "NA", "")
+                    continue
+                if (m := re.search(r"Destination: (.+)$", line)):
+                    written.append(m.group(1).strip())
+                if "[ExtractAudio] Destination" in line:
+                    from_video = picked_video
+                    if extract_start[0] is None:
+                        extract_start[0] = time.time()
                 _, display = self._parse_yt_dlp_line(line)
                 if display is not None:
                     self._update_slot(slot, title, display)
@@ -7773,6 +8066,8 @@ class FingerprinterApp:
                 # player any more. Every warning would let a harmless one
                 # decide what an error means.
                 low = line.lower()
+                if "requiring account age-verification" in low:
+                    age_verify = True
                 if (line.startswith("ERROR") or "error:" in low[:30]
                         or (low.startswith("warning") and any(p in low for p in self.SOLVER_WARNINGS))):
                     err_lines.append(line)
@@ -7790,9 +8085,20 @@ class FingerprinterApp:
         success = proc.returncode == 0 and not stopped
         if success and entry.get("_left_out"):
             self._log(f"  - Left out '{title}': outside the length limits in Settings.")
+        if success and from_video:
+            why = ("it is age-restricted and the account signed in with is not age-verified"
+                   if age_verify else "the site offered none this time")
+            self._log(f"  - '{title}': no audio-only format ({why}), so its sound was copied "
+                      f"out of the video.")
         if not success and not stopped:
+            self._delete_written(written, target_folder)
             joined = " ".join(err_lines)
             reason = self._classify_yt_dlp_error(joined)
+            # Not read from the line itself: "age-restricted" comes before
+            # "http error 403" and the network errors in the patterns, so a
+            # passing 403 on such a video would have read as permanent.
+            if reason == "no audio format available" and age_verify:
+                reason = "age-restricted (account not age-verified)"
             entry["_fail_reason"] = reason              # see RETRY_LATER
             errors = [ln for ln in err_lines if not ln.lower().startswith("warning")]
             if reason:
@@ -7827,6 +8133,27 @@ class FingerprinterApp:
         text = re.sub(r"^\[[^\]]+\]\s*(\S+:\s+)?", "", text)
         return text[:300] + ("..." if len(text) > 300 else "")
 
+    @staticmethod
+    def _delete_written(paths: list[str], folder: Path) -> None:
+        """Delete the files a failed download wrote in `folder`, with the
+        pieces yt-dlp keeps of an unfinished one (.part, .part-Frag#, .ytdl).
+        Anything outside the folder is left alone."""
+        try:
+            root = folder.resolve()
+        except OSError:
+            return
+        for p in dict.fromkeys(paths):
+            try:
+                path = Path(p).resolve()
+                if not path.is_relative_to(root):
+                    continue
+                for f in path.parent.iterdir():
+                    if f.name == path.name or f.name.startswith(path.name + ".part") \
+                            or f.name == path.name + ".ytdl":
+                        f.unlink(missing_ok=True)
+            except OSError:
+                pass
+
     # Download failures that may well work the next time the link runs; the
     # rest (private, removed, members-only, geo-blocked, ...) fail every time.
     # None is a failure with no known reason, counted as worth another try.
@@ -7834,6 +8161,10 @@ class FingerprinterApp:
     # wording and current: a sure sign it is out of date.
     SOLVER_WARNINGS = ("nsig extraction failed", "n challenge solving failed",
                        "signature extraction failed", "signature solving failed")
+
+    # yt-dlp prints this, then the video codec of the format it picked
+    # (_download_one, --print).
+    PICKED_MARK = "[fingerprinter] picked vcodec="
 
     RETRY_LATER = {None, "network error", "HTTP 403 forbidden", "HTTP 429 rate-limited",
                    "not found (HTTP 404)",
