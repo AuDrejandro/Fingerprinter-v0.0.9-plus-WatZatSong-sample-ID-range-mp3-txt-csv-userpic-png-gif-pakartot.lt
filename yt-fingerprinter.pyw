@@ -35,9 +35,11 @@ from __future__ import annotations
 import ast
 import base64
 import bisect
+import csv
 import datetime
 import hashlib
 import http.client
+import io
 import json
 import math
 import os
@@ -51,6 +53,7 @@ import threading
 import time
 import tkinter as tk
 import tkinter.font as tkfont
+import urllib.error
 import urllib.request
 import webbrowser
 from collections.abc import Callable
@@ -75,6 +78,25 @@ def sanitize_name(name: str) -> str:
     """Make a string safe for folder names (alphanumeric + . _ -)."""
     safe = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("_")
     return safe or "channel"
+
+
+# Characters Windows forbids in a file name, plus the control range. Everything
+# else — letters of any language included — is kept.
+_WIN_BAD_CHARS = re.compile(r'[\\/:*?"<>|\x00-\x1f]+')
+
+
+def safe_filename_unicode(name: str, fallback: str = "track") -> str:
+    """A file name that keeps its letters, whatever language they are in
+    (Lithuanian ąčęėįšųūž, Cyrillic, and so on), and only takes out what
+    Windows will not allow in a name. sanitize_name flattens everything to
+    ASCII for folder and .pklz names, where a plain name matters; this is for
+    the audio files themselves, where the real title reads better and
+    WerZatSong's audfprint handles non-ASCII paths. Trailing dots and spaces
+    (which Windows also dislikes at the end of a name) are trimmed."""
+    cleaned = _WIN_BAD_CHARS.sub("_", str(name or "")).strip().rstrip(". ")
+    # Collapse runs of whitespace to single spaces so names stay tidy.
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned or fallback
 
 
 def extract_handle(url: str, fallback: str = "") -> str:
@@ -199,6 +221,337 @@ def check_dependency(cmd: str | list[str]) -> bool:
         return True
     except FileNotFoundError:
         return False
+
+
+# ----- WatZatSong (watzatsong.com) sample ranges -----------------------------
+# WatZatSong is not a yt-dlp site, so its samples get their own download path
+# that still feeds the shared split + fingerprint pipeline. A range of sample
+# IDs is kept in the list as a pseudo-link, "wzs:<start>-<end>", so the queue,
+# resume and config code can treat it like any other entry. The numbers are
+# the sample IDs in watzatsong.com/en/name-that-tune/<id>, which run in order.
+WZS_BASE = "https://www.watzatsong.com"
+WZS_SCHEME = "wzs:"
+# A kind on the HTTP requests, so a server that refuses the default urllib
+# agent (watzatsong.com does, behind Cloudflare) lets them through. The same
+# strings the all-in-one userscript sends.
+WZS_HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+
+def wzs_range(url: str) -> tuple[int, int] | None:
+    """(start, end) for a "wzs:<start>-<end>" entry, start <= end, or None for
+    anything else. A single id ("wzs:1234") is the range of one."""
+    text = url.strip()
+    if not text.lower().startswith(WZS_SCHEME):
+        return None
+    body = text[len(WZS_SCHEME):].strip()
+    m = re.fullmatch(r"(\d+)(?:\s*-\s*(\d+))?", body)
+    if not m:
+        return None
+    start = int(m.group(1))
+    end = int(m.group(2)) if m.group(2) is not None else start
+    if start < 1 or end < 1:
+        return None
+    return (start, end) if start <= end else (end, start)
+
+
+def is_wzs(url: str) -> bool:
+    """True for a WatZatSong range entry (see wzs_range)."""
+    return wzs_range(url) is not None
+
+
+def wzs_make(start: int, end: int) -> str:
+    """The list entry for an ID range, normalized so start <= end."""
+    lo, hi = (start, end) if start <= end else (end, start)
+    return f"{WZS_SCHEME}{lo}-{hi}"
+
+
+def wzs_label(url: str) -> str:
+    """How a WatZatSong range reads in the list, e.g. "WatZatSong IDs 100-200"
+    or "WatZatSong ID 100". Falls back to the raw entry if it does not parse."""
+    rng = wzs_range(url)
+    if rng is None:
+        return url
+    start, end = rng
+    return f"WatZatSong ID {start}" if start == end else f"WatZatSong IDs {start}-{end}"
+
+
+def wzs_sample_page(sample_id: int) -> str:
+    """The human page for a sample, for opening a range's first id in a browser."""
+    return f"{WZS_BASE}/en/name-that-tune/{sample_id}"
+
+
+def wzs_format_comments(sample_id: int, meta: dict) -> str | None:
+    """A readable text dump of a sample's comments, from the JSON that
+    /sample/<id>.html returns, or None when it has none. Mirrors the
+    all-in-one userscript: a short header, then each comment with its time,
+    who wrote it and what it says. `timestamp` is Unix seconds."""
+    comments = meta.get("comments")
+    if not isinstance(comments, list) or not comments:
+        return None
+    lines: list[str] = []
+    for c in comments:
+        if not isinstance(c, dict):
+            continue
+        block: list[str] = []
+        ts = c.get("timestamp")
+        if isinstance(ts, (int, float)):
+            when = datetime.datetime.utcfromtimestamp(int(ts)).strftime("%Y-%m-%d %H:%M:%S UTC")
+            block.append(f"Time    : {when} (Unix {int(ts)})")
+        login = c.get("login") or (c.get("user", {}) or {}).get("login")
+        if login:
+            block.append(f"Login   : {login}")
+        if c.get("pictUrl"):
+            block.append(f"PictUrl : {c.get('pictUrl')}")
+        content = c.get("content") or c.get("text")
+        if content:
+            block.append(f"Content : {content}")
+        if block:
+            lines.append("--- Comment ---")
+            lines.extend(block)
+            lines.append("")
+    if not lines:
+        return None
+    title = meta.get("comment") or meta.get("title") or ""
+    header = [
+        f"WatZatSong sample : {sample_id}",
+        f"Page              : {WZS_BASE}/en/name-that-tune/{sample_id}",
+        f"Title             : {title}",
+        f"Comments          : {meta.get('nbComments', len(comments))}   "
+        f"Proposals: {meta.get('nbProposals', '?')}",
+        "",
+        "COMMENTS:",
+        "",
+    ]
+    return "\n".join(header + lines)
+
+
+def wzs_mp3_url(meta: dict) -> str | None:
+    """The audio address for a sample, from the JSON that /sample/<id>.html
+    returns, or None when there is none (a removed or empty sample). Matches
+    the all-in-one userscript: the current form is <base>/uploads/samples/<x>
+    taken from the sample's own "url"/"sampleUrl"; the older form is kept as a
+    fallback for samples whose address still points at /cloud/media/samples/."""
+    raw = ""
+    for key in ("url", "sampleUrl", "mp3", "file"):
+        value = meta.get(key)
+        if isinstance(value, str) and value.strip():
+            raw = value.strip()
+            break
+    if not raw:
+        return None
+    # An absolute address is used as it is; otherwise it is under the site.
+    if raw.startswith(("http://", "https://")):
+        return raw
+    m = re.search(r"uploads/samples/(.+)$", raw)
+    if m:
+        return f"{WZS_BASE}/uploads/samples/{m.group(1)}"
+    m = re.search(r"cloud/media/samples/(.+)$", raw)
+    if m:
+        return f"{WZS_BASE}/cloud/media/samples/{m.group(1)}"
+    return f"{WZS_BASE}/{raw.lstrip('/')}"
+
+
+# The columns of a sample-status row, in order, for the CSV and the TXT.
+WZS_STATUS_FIELDS = (
+    "sample_id", "status", "deleted", "closed", "sendingMode", "sendingType",
+    "nbProposals", "nbComments", "nbListenings", "timestamp", "date",
+    "postedBy", "genre", "language", "title", "url",
+)
+# sendingMode -> a readable kind, as the all-in-one userscript labels them.
+WZS_SENDING_TYPES = {1: "Recorded", 2: "Uploaded", 3: "iPhone app"}
+
+
+def wzs_status_row(sample_id: int, meta: dict | None) -> dict:
+    """A flat status record for one sample, for the CSV/TXT export. `meta` is
+    the sample JSON from /sample/<id>.html, or None for a sample that no
+    longer exists (status "removed")."""
+    base = {k: "" for k in WZS_STATUS_FIELDS}
+    base["sample_id"] = str(sample_id)
+    base["url"] = f"{WZS_BASE}/en/name-that-tune/{sample_id}"
+    if meta is None:
+        base["status"] = "removed"
+        return base
+    if meta.get("_cloudflare") or meta.get("_error") or meta.get("_http_error"):
+        base["status"] = "error"
+        return base
+
+    def num(key: str) -> int:
+        try:
+            return int(meta.get(key) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    deleted = num("deleted")
+    sending = num("sendingMode")
+    ts = num("timestamp")
+    base.update({
+        "status": "deleted" if deleted else "active",
+        "deleted": "1" if deleted else "0",
+        "closed": "1" if meta.get("closed") else "0",
+        "sendingMode": str(sending) if sending else "",
+        "sendingType": WZS_SENDING_TYPES.get(sending, ""),
+        "nbProposals": str(num("nbProposals")),
+        "nbComments": str(num("nbComments")),
+        "nbListenings": str(num("nbListenings")),
+        "timestamp": str(ts) if ts else "",
+        "date": (datetime.datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S UTC")
+                 if ts else ""),
+        "postedBy": str((meta.get("user") or {}).get("login") or "")
+                    if isinstance(meta.get("user"), dict) else "",
+        "genre": str(meta.get("genre") or ""),
+        "language": str(meta.get("language") or ""),
+        "title": str(meta.get("comment") or meta.get("title") or ""),
+    })
+    return base
+
+
+def wzs_status_csv(rows: list[dict]) -> str:
+    """`rows` as CSV text (WZS_STATUS_FIELDS header), quoted where needed."""
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=list(WZS_STATUS_FIELDS),
+                            extrasaction="ignore", lineterminator="\n")
+    writer.writeheader()
+    writer.writerows(rows)
+    return buf.getvalue()
+
+
+def wzs_status_txt(rows: list[dict], start: int, end: int) -> str:
+    """`rows` as a readable text report, a block per sample."""
+    out = [
+        f"WatZatSong sample statuses: IDs {start}-{end}",
+        f"Exported: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        f"Samples: {len(rows)}",
+        "=" * 50, "",
+    ]
+    for r in rows:
+        out.append(f"[{r['sample_id']}] {r.get('status', '')}")
+        for key in ("postedBy", "title", "genre", "language", "sendingType",
+                    "nbProposals", "nbComments", "nbListenings", "date", "url"):
+            value = r.get(key)
+            if value:
+                out.append(f"    {key}: {value}")
+        out.append("")
+    return "\n".join(out)
+
+
+def wzs_profile_picture_url(username: str, page: str) -> tuple[str, str] | None:
+    """(url, source) of a user's profile picture from their /en/profile/<user>
+    page, or None for the default avatar (nothing to download). `source` is
+    "facebook", "google" or "wzs". Mirrors the all-in-one userscript's
+    #profile-pict reading."""
+    fb = re.search(r'id="profile-pict"[^>]*url\(https://graph\.facebook\.com/([^/]+)/picture',
+                   page)
+    if fb:
+        return (f"https://graph.facebook.com/{fb.group(1)}/picture?type=large", "facebook")
+    g = re.search(r'id="profile-pict"[^>]*url\((https://lh3\.googleusercontent\.com/[^)]+)\)',
+                  page)
+    if g:
+        return (g.group(1), "google")
+    wzs = re.search(r'id="profile-pict"[^>]*url\(/uploads/profiles/(\d+)\.jpg\?m=(\d+)\)', page)
+    if wzs:
+        return (f"{WZS_BASE}/uploads/profiles/{wzs.group(1)}.jpg?m={wzs.group(2)}", "wzs")
+    return None
+
+
+def image_ext_from_bytes(data: bytes, fallback: str = ".jpg") -> str:
+    """The file extension for image `data` by its magic bytes, or `fallback`.
+    Covers the formats WatZatSong avatars come in (jpg/png/gif/webp)."""
+    if data[:3] == b"GIF":
+        return ".gif"
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return ".png"
+    if data[:2] == b"\xff\xd8":
+        return ".jpg"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return ".webp"
+    return fallback
+
+
+# ----- pakartot.lt album/playlist --------------------------------------------
+# pakartot.lt is not a yt-dlp site. An album or playlist page carries the id
+# of its "play all" button; its tracks come from a small POST API, and each
+# track's audio is a file under stream1.pakartot.lt. The API needs a signed-in
+# session (logged out it answers {"result":false,"info":"no_login"}), so a
+# pakartot.lt link uses the same Sign-in-with-cookies browser as WatZatSong.
+# Only album and playlist pages are taken; artist (/project/) and single-track
+# pages are not. The link stays a normal URL in the list (it opens in a
+# browser), unlike a WatZatSong range.
+PAKARTOT_BASE = "https://www.pakartot.lt"
+PAKARTOT_STREAM = "https://stream1.pakartot.lt/"
+PAKARTOT_PLAY_API = "https://www.pakartot.lt/api/backend/frontend/player/play.php"
+
+
+def pakartot_kind(url: str) -> str | None:
+    """"album", "playlist" or "project" (an artist page) for a pakartot.lt
+    link, else None. A single-track page (/album/<slug>/<track>) is not one
+    of these. A project is run by fetching each album it links to."""
+    try:
+        parts = urlsplit(url if "://" in url else "https://" + url)
+    except ValueError:
+        return None
+    host = parts.netloc.lower().removeprefix("www.").removeprefix("m.")
+    if host != "pakartot.lt":
+        return None
+    segs = [s for s in parts.path.split("/") if s]
+    if len(segs) == 2 and segs[0] in ("album", "playlist", "project"):
+        return segs[0]
+    return None
+
+
+def is_pakartot(url: str) -> bool:
+    """True for a pakartot.lt album, playlist or project link (see pakartot_kind)."""
+    return pakartot_kind(url) is not None
+
+
+def pakartot_album_links(page: str) -> list[str]:
+    """Every pakartot.lt album link on an artist (project) page, in the order
+    they appear, de-duplicated. Playlists and single-track pages are left out:
+    only /album/<slug> (two path segments) is taken."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for m in re.finditer(r'href="(https://www\.pakartot\.lt/album/[^"#?]+)"', page):
+        link = m.group(1).rstrip("/")
+        # /album/<slug> only — a track page is /album/<slug>/<track>.
+        if link.count("/") != 4:        # https:/ / www.. / album / slug
+            continue
+        if link not in seen:
+            seen.add(link)
+            out.append(link)
+    return out
+
+
+def pakartot_track_url(filename: str) -> str | None:
+    """The audio address for a track's `filename` from the play API: used as
+    it is when absolute, otherwise placed under stream1.pakartot.lt, exactly
+    as the pakartot downloader does."""
+    if not isinstance(filename, str) or not filename.strip():
+        return None
+    fn = filename.strip()
+    if fn.startswith(("http://", "https://")):
+        return fn
+    return PAKARTOT_STREAM + fn.lstrip("/")
+
+
+# Cover-art sizes pakartot.lt serves; the size is a path segment in the image
+# URL (.../images/<xx>/<WxH>/<file>). The largest is downloaded by default.
+PAKARTOT_COVER_SIZE = "348x348"
+
+
+def pakartot_cover_url(src: str, size: str = PAKARTOT_COVER_SIZE) -> str | None:
+    """A cover image address at `size`, from the page's thumbnail `src` (which
+    carries some other <W>x<H> segment). Absolute addresses only; None for an
+    empty or relative one. If no size segment is present it is returned as is."""
+    if not isinstance(src, str) or not src.strip():
+        return None
+    url = src.strip()
+    if not url.startswith(("http://", "https://")):
+        url = PAKARTOT_BASE + "/" + url.lstrip("/")
+    return re.sub(r"/\d+x\d+/", f"/{size}/", url, count=1)
 
 
 # ----- recent URLs persistence -----------------------------------------------
@@ -825,6 +1178,12 @@ class FingerprinterApp:
     # default stays moderate and the ceiling finite.
     DEFAULT_PARALLEL = 8
     MAX_PARALLEL = 32
+    # The wait between WatZatSong samples (Settings, Downloads), in
+    # milliseconds. WatZatSong is fetched one sample at a time, so this stands
+    # in for "Downloads at once" there. 500 ms is the default the userscript
+    # uses; _wzs_delay_seconds reads and clamps the setting.
+    WZS_DEFAULT_DELAY_MS = 500
+    WZS_MAX_DELAY_MS = 10000
     # Characters the link box takes: a few dozen links pasted at once.
     LINK_BOX_MAX = 5000
 
@@ -998,6 +1357,39 @@ class FingerprinterApp:
         Tooltip(self.queue_import_btn,
                 "Add links from a text file: one per line, or @handles and "
                 "channel IDs. Lines starting with # are skipped.")
+
+        # WatZatSong (watzatsong.com) is not a yt-dlp site, so its samples are
+        # added as a numeric ID range instead of a link: from one sample id to
+        # another. The range becomes one entry in the list and runs through the
+        # same split + fingerprint pipeline. Sign in with cookies from a
+        # browser (Settings, Downloads) first; the site refuses samples
+        # otherwise.
+        ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=8)
+        ttk.Label(bar, text="WatZatSong IDs:").pack(side="left", padx=(0, 4))
+        self.wzs_from_var = tk.StringVar()
+        self.wzs_to_var = tk.StringVar()
+        digits = self.root.register(lambda s: s == "" or (s.isdigit() and len(s) <= 9))
+        self.wzs_from_entry = ttk.Entry(bar, textvariable=self.wzs_from_var, width=8,
+                                        validate="key", validatecommand=(digits, "%P"))
+        self.wzs_from_entry.pack(side="left")
+        ttk.Label(bar, text="to").pack(side="left", padx=4)
+        self.wzs_to_entry = ttk.Entry(bar, textvariable=self.wzs_to_var, width=8,
+                                      validate="key", validatecommand=(digits, "%P"))
+        self.wzs_to_entry.pack(side="left")
+        self.wzs_add_btn = ttk.Button(bar, text="Add range", width=10,
+                                      command=self._add_wzs_range)
+        self.wzs_add_btn.pack(side="left", padx=(6, 0))
+        for entry in (self.wzs_from_entry, self.wzs_to_entry):
+            entry.bind("<Return>", lambda _e: self.wzs_add_btn.invoke())
+        Tooltip(self.wzs_from_entry,
+                "The first WatZatSong sample ID to download (the number in a "
+                "watzatsong.com/en/name-that-tune/<id> page).")
+        Tooltip(self.wzs_to_entry,
+                "The last WatZatSong sample ID. Leave blank to add just the one.")
+        Tooltip(self.wzs_add_btn,
+                "Add this range of WatZatSong samples to the list. They download "
+                "one at a time (every 0.5s), then split and fingerprint like any "
+                "link. Sign in with cookies from a browser in Settings, Downloads first.")
 
         # Row 2: the run.
         bar = ttk.Frame(self.root)
@@ -1482,9 +1874,93 @@ class FingerprinterApp:
         self._help(
             tab,
             "For private, members-only or age-restricted items: yt-dlp uses your login "
-            "from that browser. Close the browser first; Firefox works most reliably.",
+            "from that browser. Close the browser first; Firefox works most reliably. "
+            "WatZatSong ID ranges use this login too (the site needs it).",
             wrap=560,
         ).pack(anchor="w", padx=4, pady=(1, 8))
+
+        # WatZatSong fetches its samples one at a time (it is not a yt-dlp site
+        # and has no "Downloads at once"); this is the wait between them, to be
+        # polite to the site. The default is half a second.
+        row = ttk.Frame(tab)
+        row.pack(fill="x")
+        ttk.Label(row, text="Wait between WatZatSong samples:").pack(side="left", padx=(0, 4))
+        self.wzs_delay_var = tk.IntVar(value=self.WZS_DEFAULT_DELAY_MS)
+        self.wzs_delay_spin = ttk.Spinbox(
+            row, from_=0, to=10000, increment=100, textvariable=self.wzs_delay_var, width=7)
+        self.wzs_delay_spin.pack(side="left")
+        ttk.Label(row, text="milliseconds").pack(side="left", padx=(4, 0))
+        self._help(
+            tab,
+            "The pause between one WatZatSong sample and the next, in a range added with "
+            "the WatZatSong IDs boxes in the toolbar. Default 500. Raise it if the site "
+            "starts refusing samples; it does not affect yt-dlp downloads.",
+            wrap=560,
+        ).pack(anchor="w", padx=4, pady=(1, 8))
+
+        self.wzs_comments_var = tk.BooleanVar(value=False)
+        self.wzs_comments_check = ttk.Checkbutton(
+            tab, text="Also export WatZatSong comments", variable=self.wzs_comments_var)
+        self.wzs_comments_check.pack(anchor="w", pady=1)
+        self._help(
+            tab,
+            "For each WatZatSong sample that has comments, save them as a text file next "
+            "to the fingerprints, in a WZS-comments folder (the sample's time, who wrote "
+            "it and what they said). Off by default; only WatZatSong ranges use it.",
+            wrap=560,
+        ).pack(anchor="w", padx=22, pady=(0, 8))
+
+        self.wzs_status_csv_var = tk.BooleanVar(value=False)
+        self.wzs_status_csv_check = ttk.Checkbutton(
+            tab, text="Export WatZatSong sample statuses to CSV",
+            variable=self.wzs_status_csv_var)
+        self.wzs_status_csv_check.pack(anchor="w", pady=1)
+        self._help(
+            tab,
+            "For a WatZatSong ID range, save a CSV of each sample's status (active, "
+            "removed, deleted, closed), its proposals, comments, who posted it and when, "
+            "in a WZS-status folder next to the fingerprints. The file name carries the "
+            "range and a timestamp.",
+            wrap=560,
+        ).pack(anchor="w", padx=22, pady=(0, 6))
+
+        self.wzs_status_txt_var = tk.BooleanVar(value=False)
+        self.wzs_status_txt_check = ttk.Checkbutton(
+            tab, text="Export WatZatSong sample statuses to TXT",
+            variable=self.wzs_status_txt_var)
+        self.wzs_status_txt_check.pack(anchor="w", pady=1)
+        self._help(
+            tab,
+            "The same sample statuses as a readable text file, alongside the CSV in the "
+            "WZS-status folder.",
+            wrap=560,
+        ).pack(anchor="w", padx=22, pady=(0, 6))
+
+        self.wzs_userpics_var = tk.BooleanVar(value=False)
+        self.wzs_userpics_check = ttk.Checkbutton(
+            tab, text="Download WatZatSong user pictures",
+            variable=self.wzs_userpics_var)
+        self.wzs_userpics_check.pack(anchor="w", pady=1)
+        self._help(
+            tab,
+            "Download each sample poster's profile picture, into a WZS-userpics folder "
+            "next to the fingerprints, keeping its real image format. The Google or "
+            "Facebook avatar is fetched when the profile links one; the default avatar "
+            "is skipped. One picture per poster.",
+            wrap=560,
+        ).pack(anchor="w", padx=22, pady=(0, 8))
+
+        self.pakartot_cover_var = tk.BooleanVar(value=False)
+        self.pakartot_cover_check = ttk.Checkbutton(
+            tab, text="Download pakartot.lt cover art", variable=self.pakartot_cover_var)
+        self.pakartot_cover_check.pack(anchor="w", pady=1)
+        self._help(
+            tab,
+            "For each pakartot.lt album, save its cover image next to the fingerprints, "
+            "in a pakartot-covers folder, named after the artist and album. Off by "
+            "default; only pakartot.lt links use it.",
+            wrap=560,
+        ).pack(anchor="w", padx=22, pady=(0, 8))
 
         row = ttk.Frame(tab)
         row.pack(fill="x")
@@ -2505,6 +2981,12 @@ class FingerprinterApp:
         ("batch_size_var", "batch_size", int),
         ("fp_concurrency_var", "fp_concurrency", int),
         ("cookies_browser_var", "cookies_browser", str),
+        ("wzs_delay_var", "wzs_delay_ms", int),
+        ("wzs_comments_var", "wzs_export_comments", bool),
+        ("wzs_status_csv_var", "wzs_status_csv", bool),
+        ("wzs_status_txt_var", "wzs_status_txt", bool),
+        ("wzs_userpics_var", "wzs_userpics", bool),
+        ("pakartot_cover_var", "pakartot_cover_art", bool),
         ("min_seconds_var", "skip_shorter_than", int),
         ("max_minutes_var", "skip_longer_than", int),
         ("skip_done_var", "skip_done", bool),
@@ -3770,7 +4252,9 @@ class FingerprinterApp:
         # As wide as its text, not the row: only the link itself opens it, and
         # a click on the empty space beside it selects the row. A long link is
         # still cut short to the room left.
-        link = tk.Label(frame, text=url, bg=bg, fg=self.QLINK_FG, font=self._link_font,
+        # A WatZatSong range reads as "WatZatSong IDs 100-200" rather than its
+        # raw "wzs:100-200" entry.
+        link = tk.Label(frame, text=wzs_label(url), bg=bg, fg=self.QLINK_FG, font=self._link_font,
                         cursor="hand2", anchor="w")
         link.pack(side="left", padx=(4, 0))
 
@@ -3790,7 +4274,9 @@ class FingerprinterApp:
             fg=self.QREMOVE_HOVER_FG if self._queue_editable else self.QMUTED_FG))
         remove.bind("<Leave>", lambda e: e.widget.config(fg=self.QMUTED_FG))
         Tooltip(handle, "Drag to move this link up or down the list.")
-        Tooltip(link, lambda: f"Open {url} in your browser.")
+        Tooltip(link, lambda: (
+            f"Open the first sample ({wzs_sample_page(wzs_range(url)[0])}) in your browser."
+            if is_wzs(url) else f"Open {url} in your browser."))
         Tooltip(count, lambda: self._count_tip(url))
         Tooltip(remove, "Remove from the list.")
         return row
@@ -3973,6 +4459,12 @@ class FingerprinterApp:
 
     @staticmethod
     def _open_link(url: str) -> None:
+        # A WatZatSong range opens its first sample's page; it has no link of
+        # its own.
+        rng = wzs_range(url)
+        if rng is not None:
+            webbrowser.open(wzs_sample_page(rng[0]))
+            return
         webbrowser.open(url if "://" in url else f"https://{url}")
 
     def _copy_text(self, text: str) -> None:
@@ -4163,6 +4655,13 @@ class FingerprinterApp:
 
     @staticmethod
     def _count_noun(url: str) -> str:
+        if is_wzs(url):
+            return "sample"
+        kind = pakartot_kind(url)
+        if kind == "project":
+            return "album"
+        if kind in ("album", "playlist"):
+            return "track"
         return "video" if re.search(r"(^|[/.])(youtube\.com|youtu\.be)(/|$)", url) else "item"
 
     def _items_done(self, url: str) -> tuple[int, int] | None:
@@ -4263,8 +4762,12 @@ class FingerprinterApp:
             url = self._count_queue.get()
             try:
                 # Not the link running now: its run lists it anyway, and
-                # records the count when it does.
-                if url in self.queue_urls and url != self._running_url and not self._closing:
+                # records the count when it does. A WatZatSong range is not a
+                # yt-dlp link (its count is the size of the range, set when it
+                # was added); a pakartot.lt link is counted by its own run,
+                # which reads the track list, not by yt-dlp here.
+                if (url in self.queue_urls and url != self._running_url
+                        and not self._closing and not is_wzs(url) and not is_pakartot(url)):
                     self._count_one(url)
             except Exception as e:  # noqa: BLE001
                 self._log(f"[!] Could not count {url}: {e!r}")
@@ -4843,6 +5346,65 @@ class FingerprinterApp:
         for token in invalid:
             self._log(f"[!] Not a link, left in the link box: {token}", tag="warning")
 
+    # How many WatZatSong IDs one range may hold, so a slip of the keyboard
+    # (a missing digit, two IDs swapped into millions apart) does not queue a
+    # run of hundreds of thousands of requests by accident. It only asks; a
+    # bigger range is still allowed on confirming.
+    WZS_RANGE_WARN = 5000
+
+    def _add_wzs_range(self) -> None:
+        """Add a WatZatSong sample-ID range from the two toolbar boxes as one
+        list entry ("wzs:<start>-<end>"). The "to" box may be left blank for a
+        single sample. A range already in the list is not added again."""
+        from_text = self.wzs_from_var.get().strip()
+        to_text = self.wzs_to_var.get().strip()
+        if not from_text:
+            MessageBox.showerror(
+                "No WatZatSong ID",
+                "Type the first sample ID (the number in a "
+                "watzatsong.com/en/name-that-tune/<id> page).",
+                parent=self.root)
+            return
+        start = int(from_text)
+        end = int(to_text) if to_text else start
+        if start < 1 or end < 1:
+            MessageBox.showerror("Bad WatZatSong ID", "Sample IDs start at 1.",
+                                 parent=self.root)
+            return
+        lo, hi = (start, end) if start <= end else (end, start)
+        count = hi - lo + 1
+        delay = self._wzs_delay_seconds()
+        if count > self.WZS_RANGE_WARN and not MessageBox.askyesno(
+            "Large range",
+            f"That is {count:,} WatZatSong samples, fetched one at a time"
+            + (f" every {delay:g}s (at least {fmt_time(count * delay)})" if delay > 0 else "")
+            + ". Add it anyway?",
+            parent=self.root):
+            return
+
+        url = wzs_make(lo, hi)
+        if link_key(url) in {link_key(u) for u in self.queue_urls}:
+            row = next(i for i, u in enumerate(self.queue_urls) if link_key(u) == link_key(url))
+            self.queue_active = row
+            self._paint_queue_rows()
+            self._scroll_to_row(row)
+            self.status_var.set(f"Already in the list (row {row + 1}).")
+            self._log(f"[!] Already in the list, row {row + 1}: {wzs_label(url)}")
+            return
+
+        self.queue_urls.append(url)
+        self.queue_checks.append(self._new_check())
+        self.queue_results.pop(url, None)
+        # Its count is just the size of the range; no listing to do.
+        self._record_count(url, count, single=(count == 1))
+        self._refresh_queue(active_index=len(self.queue_urls) - 1)
+        save_config(self._gather_config())
+        self._scroll_to_row(len(self.queue_urls) - 1)
+        self.wzs_from_var.set("")
+        self.wzs_to_var.set("")
+        self.status_var.set(f"Added {wzs_label(url)}.")
+        self._log(f"[+] Added {wzs_label(url)}.")
+
     # Recognizes a bare YouTube channel ID, e.g. UCxN0K3hMnvgtsoz9NN0Iq_Q.
     _CHANNEL_ID_RE = re.compile(r"^UC[A-Za-z0-9_-]{22}$")
     # Recognizes a bare @handle, e.g. @Muzarkive.
@@ -5057,6 +5619,8 @@ class FingerprinterApp:
         for btn in (
             self.queue_import_btn, self.queue_remove_btn, self.sort_btn,
             self.tick_all_btn, self.queue_clear_btn, self.tick_unfinished_btn,
+            # The WatZatSong range boxes and button add to the list too.
+            self.wzs_from_entry, self.wzs_to_entry, self.wzs_add_btn,
         ):
             btn.config(state=state)
         self._update_add_btn()
@@ -6235,6 +6799,13 @@ class FingerprinterApp:
         self.verbose_check.config(state="disabled" if locked else "normal")
         # Read as each link is listed, downloaded and recorded.
         self.cookies_combo.config(state="disabled" if locked else "readonly")
+        # Read at the start of each WatZatSong range.
+        self.wzs_delay_spin.config(state="disabled" if locked else "normal")
+        self.wzs_comments_check.config(state="disabled" if locked else "normal")
+        self.wzs_status_csv_check.config(state="disabled" if locked else "normal")
+        self.wzs_status_txt_check.config(state="disabled" if locked else "normal")
+        self.wzs_userpics_check.config(state="disabled" if locked else "normal")
+        self.pakartot_cover_check.config(state="disabled" if locked else "normal")
         for widget in (self.min_seconds_spin, self.max_minutes_spin,
                        self.skip_done_check, self.forget_done_btn):
             widget.config(state="disabled" if locked else "normal")
@@ -6321,6 +6892,78 @@ class FingerprinterApp:
 
     # ------------------------- pipeline ---------------------------------------
 
+    def _run_pakartot_project(
+        self, url: str, output_base: Path, bat_dir: Path,
+        queue_mode: bool, queue_position: tuple[int, int] | None, restarting: bool,
+    ) -> str | None:
+        """A pakartot.lt artist (project) page: run each album it links to as
+        its own album, so each gets its own artist+album download folder and
+        .pklz. The project's overall status is "done" when every album is
+        done, "incomplete" when some could not finish (not signed in, a
+        network error), "failed" when none ran, and "cancelled"/"skipped" for
+        Stop/Skip. Honours Stop and Skip between albums."""
+        qp = f"[{queue_position[0]}/{queue_position[1]}] " if queue_position else ""
+        self._stage = "listing"
+        self._set_status(f"{qp}Reading the artist page...")
+        self._log(f"[*] pakartot.lt artist page: {url}")
+        albums = self._pakartot_project_albums(url)
+        if self.cancel_flag.is_set():
+            return "cancelled"
+        if self.skip_flag.is_set():
+            return "skipped"
+        if albums is None:
+            return "incomplete"     # fetch error, worth another run
+        if not albums:
+            self._log("[+] pakartot.lt: this artist page lists no albums.")
+            self._set_status(f"{qp}Nothing new.")
+            return "done"
+        self._log(f"[+] pakartot.lt: {len(albums)} album(s) on this artist page.")
+        # The row's running count follows the albums done, not tracks.
+        if queue_mode:
+            self._item_progress = {"url": url, "done": 0, "total": len(albums), "base": 0}
+            self.root.after(0, self._record_count, url, len(albums), False)
+            self.root.after(0, self._update_count_label, url)
+
+        statuses: list[str] = []
+        for i, album_url in enumerate(albums, start=1):
+            if self.cancel_flag.is_set():
+                return "cancelled"
+            if self.skip_flag.is_set():
+                self._log(f"[!] {qp}Skipping the rest of this artist's albums.", tag="warning")
+                break
+            self._log("-" * 50)
+            self._log(f"[*] {qp}Album {i}/{len(albums)}: {album_url}")
+            # Each album is a full run of its own; it makes its own subfolder
+            # and .pklz. Not queue_mode at this level (no per-album list state),
+            # but interactive prompts are suppressed because the project runs
+            # unattended: _run_pipeline treats these as a normal album.
+            status = self._run_pipeline(
+                album_url, output_base, bat_dir, queue_mode=True,
+                queue_position=None, restarting=False,
+            )
+            statuses.append(status or "done")
+            # Each album's run set and then cleared self._item_progress (for its
+            # own row). Put the project's own counter back, moved on by one, so
+            # the artist row keeps showing "N of M albums".
+            if queue_mode:
+                done_now = sum(1 for s in statuses if s == "done")
+                self._item_progress = {"url": url, "done": done_now,
+                                       "total": len(albums), "base": 0}
+                self.root.after(0, self._update_count_label, url)
+
+        if not statuses:
+            return "cancelled" if self.cancel_flag.is_set() else "skipped"
+        done = sum(1 for s in statuses if s == "done")
+        self._log("-" * 50)
+        self._log(f"[+] {qp}Artist page: {done}/{len(albums)} album(s) done.")
+        if self.cancel_flag.is_set():
+            return "cancelled"
+        if all(s == "done" for s in statuses) and len(statuses) == len(albums):
+            return "done"
+        if done == 0:
+            return "failed" if all(s == "failed" for s in statuses) else "incomplete"
+        return "incomplete"
+
     def _run_pipeline(
         self,
         url: str,
@@ -6364,143 +7007,277 @@ class FingerprinterApp:
                           "Press Check setup to install it.")
                 return "failed"
 
-            # 1. Extract video list
-            self._stage = "listing"
-            self._set_status(f"{qp}Extracting playlist info...")
-            self._log(f"[*] Fetching info for: {url}")
-            info = self._extract_info(url)
-            if info is None:
-                # Stop and Skip kill the listing, which then has nothing to return.
-                return stopped() or "failed"
-            if (s := stopped()):
-                return s
-            # yt-dlp stopped listing part-way (_extract_info): what it found is
-            # run, but the link is not done in full, and its count is not the
-            # link's count.
-            cut_short = bool(info.get("cut_short"))
+            # A pakartot.lt artist page is not one source but many: run each
+            # of its albums as its own album (own folder, own .pklz).
+            if pakartot_kind(url) == "project":
+                return self._run_pakartot_project(
+                    url, output_base, bat_dir, queue_mode, queue_position, restarting)
 
-            channel_name_raw = (
-                info.get("channel")
-                or info.get("uploader")
-                or info.get("title")
-                or "channel"
-            )
-            channel_name = sanitize_name(channel_name_raw)
-            # Handle for naming pklz files — prefer the @handle from the URL,
-            # fall back to the channel name yt-dlp reported.
-            pklz_prefix = extract_handle(url, fallback=channel_name_raw)
-            entries = [e for e in (info.get("entries") or []) if e]
-            # A single video lists as one entry with no playlist title.
-            single = not entries or (len(entries) == 1 and not info.get("title"))
-            if not entries:
-                entries = [info]  # single video fallback
-            # The listing just done is a fresh count for the list.
-            if not cut_short:
-                self.root.after(0, self._record_count, url, len(entries), single)
-
-            self._log(f"[+] Source: {channel_name_raw}  ({len(entries)} item(s))")
-            if (s := stopped()):
-                return s
-            listed = len(entries)
-            # Settings, Downloads: items outside the length limits, and items
-            # fingerprinted in an earlier run, are left out here.
-            entries = self._filter_entries(entries)
-            if queue_mode:
-                # The row's counter: what was left out has nothing left to do;
-                # each download adds one as it ends (_download_parallel).
-                base = listed - len(entries)
-                # A listing cut short is not the link's count: count against
-                # the last full count instead.
-                total = listed if not cut_short else max(
-                    listed, int((self.queue_counts.get(url) or {}).get("n") or 0))
-                self._item_progress = {"url": url, "done": base, "total": total, "base": base}
-                self.root.after(0, self._update_count_label, url)
-            if not entries:
-                self._log(f"[+] {qp}Nothing new to download for this link.")
-                self._set_status(f"{qp}Nothing new.")
-                return "incomplete" if cut_short else "done"
-
-            # Resolve this channel's download subfolder now (needed for the
-            # pre-download cleanup check below).
-            target_folder_name = f"{channel_name}_subfolder"
-            initial_folder = output_base / target_folder_name
-
-            # 1.5 Pre-download cleanup: if this channel's subfolder already has
-            #     content (e.g. a leftover partial run), ask to clear it. This
-            #     runs in queue mode too — it only touches THIS channel's
-            #     subfolder, never other channels' folders.
-            if initial_folder.is_dir():
-                if restarting:
-                    # Left by the run that stopped in this link; it starts over.
-                    self._log("[*] Clearing what the stopped run left in this link's download folder.")
+            # 1. Build the download folder from the source, then fetch it.
+            #    WatZatSong ID ranges (wzs:...) are not a yt-dlp site, so they
+            #    take their own path (_wzs_download_stage) that fills the same
+            #    variables the shared split + fingerprint tail below expects:
+            #    channel_name, pklz_prefix, initial_folder, ok, retry_later,
+            #    cut_short and self._item_progress.
+            if is_wzs(url):
+                start, end = wzs_range(url)
+                cut_short = False
+                channel_name = sanitize_name(f"WZS_{start}-{end}")
+                pklz_prefix = channel_name
+                count = end - start + 1
+                self._log(f"[+] Source: {wzs_label(url)}  ({count} sample(s))")
+                initial_folder = output_base / f"{channel_name}_subfolder"
+                if initial_folder.is_dir():
+                    if restarting:
+                        self._log("[*] Clearing what the stopped run left in this link's "
+                                  "download folder.")
+                        self._clear_download_folder(initial_folder)
+                    elif not self._preflight_clean(
+                        initial_folder, ("",), label_for_root="download folder",
+                    ):
+                        return "cancelled"
+                self._check_free_space(output_base)
+                initial_folder.mkdir(parents=True, exist_ok=True)
+                self._log(f"[+] Download folder: {initial_folder}")
+                if queue_mode:
+                    self._item_progress = {"url": url, "done": 0, "total": count, "base": 0}
+                    self.root.after(0, self._update_count_label, url)
+                self._stage = "download"
+                self._set_status(f"{qp}Downloading 0/{count} (WatZatSong)...")
+                # Settings, Downloads: comments, statuses and user pictures all
+                # go beside the fingerprints, so they survive the download
+                # folder being deleted after fingerprinting.
+                keep = self._keep_dir(bat_dir)
+                comments_dir = (keep / "WZS-comments"
+                                if self.wzs_comments_var.get() else None)
+                exports = {
+                    "want_csv": self.wzs_status_csv_var.get(),
+                    "want_txt": self.wzs_status_txt_var.get(),
+                    "status_dir": keep / "WZS-status",
+                    "pics_dir": (keep / "WZS-userpics"
+                                 if self.wzs_userpics_var.get() else None),
+                }
+                ok, fail = self._wzs_download_stage(url, initial_folder, queue_mode, count,
+                                                    comments_dir, exports)
+                if (s := stopped()):
+                    return s
+                retry_later = self._retry_later
+                if ok == 0:
+                    if retry_later:
+                        self._log("[X] No WatZatSong samples downloaded (the site refused them; "
+                                  "check 'Sign in with cookies from' in Settings, Downloads). "
+                                  "Running the range again tries them.", tag="warning")
+                        self._clear_download_folder(initial_folder)
+                        return "incomplete"
+                    self._log("[+] No WatZatSong samples found in that range (all missing or "
+                              "empty).")
                     self._clear_download_folder(initial_folder)
-                elif not self._preflight_clean(
-                    initial_folder, ("",), label_for_root="download folder",
-                ):
-                    return "cancelled"
-
-            # 1a. Subset selection — interactive only outside queue mode.
-            #     In queue mode we download everything (can't cherry-pick
-            #     unattended across many channels).
-            if not queue_mode and len(entries) > 1:
-                selected = self._select_subset(entries)
-                if selected is None:
-                    self._log("[X] Selection cancelled. Aborting.")
-                    self._set_status("Aborted.")
-                    return "cancelled"
-                if not selected:
-                    self._log("[X] Nothing selected. Aborting.")
-                    self._set_status("Aborted.")
+                    self._set_status(f"{qp}Nothing new.")
+                    return "done"
+            elif is_pakartot(url):
+                cut_short = False
+                kind = pakartot_kind(url)
+                self._stage = "listing"
+                self._set_status(f"{qp}Reading the {kind}...")
+                self._log(f"[*] pakartot.lt {kind}: {url}")
+                info = self._pakartot_tracks(url)
+                if (s := stopped()):
+                    return s
+                if info is None:
                     return "failed"
-                if len(selected) != len(entries):
-                    self._log(
-                        f"[+] Selection: {len(selected)} of {len(entries)} item(s) "
-                        f"({len(entries) - len(selected)} skipped)."
-                    )
-                entries = selected
-
-            # 1b. Size/time estimate — interactive only outside queue mode.
-            # Clamped here as well: a Spinbox's range does not stop typed values.
-            workers = min(self.MAX_PARALLEL,
-                          self._safe_int(self.parallel_var, self.DEFAULT_PARALLEL))
-            if queue_mode:
-                self._confirm_estimate(entries, workers, log_only=True)
+                if info.get("_retry"):
+                    # Not signed in, or a network error: worth another run.
+                    return "incomplete"
+                tracks = info.get("tracks") or []
+                # Name after "Artist - Title" when the page gave them, else the
+                # URL slug.
+                slug = sanitize_name(url.rstrip("/").rsplit("/", 1)[-1]) or "pakartot"
+                name_bits = " - ".join(b for b in (info.get("artist"), info.get("title")) if b)
+                channel_name = sanitize_name(name_bits) or slug
+                pklz_prefix = channel_name
+                count = len(tracks)
+                self._log(f"[+] Source: {name_bits or slug}  ({count} track(s))")
+                if not cut_short:
+                    self.root.after(0, self._record_count, url, count, count == 1)
+                if count == 0:
+                    self._log(f"[+] {qp}No tracks on this {kind}.")
+                    self._set_status(f"{qp}Nothing new.")
+                    return "done"
+                initial_folder = output_base / f"{channel_name}_subfolder"
+                if initial_folder.is_dir():
+                    if restarting:
+                        self._log("[*] Clearing what the stopped run left in this link's "
+                                  "download folder.")
+                        self._clear_download_folder(initial_folder)
+                    elif not self._preflight_clean(
+                        initial_folder, ("",), label_for_root="download folder",
+                    ):
+                        return "cancelled"
+                self._check_free_space(output_base)
+                initial_folder.mkdir(parents=True, exist_ok=True)
+                self._log(f"[+] Download folder: {initial_folder}")
+                if queue_mode:
+                    self._item_progress = {"url": url, "done": 0, "total": count, "base": 0}
+                    self.root.after(0, self._update_count_label, url)
+                # Settings, Downloads: the album cover, beside the fingerprints
+                # in a pakartot-covers folder, named like the .pklz.
+                if self.pakartot_cover_var.get() and info.get("cover"):
+                    self._pakartot_download_cover(
+                        info["cover"], self._keep_dir(bat_dir) / "pakartot-covers", channel_name)
+                self._stage = "download"
+                self._set_status(f"{qp}Downloading 0/{count} (pakartot.lt)...")
+                album_meta = {"title": info.get("title"), "artist": info.get("artist")}
+                ok, fail = self._pakartot_download_stage(tracks, initial_folder, queue_mode, url,
+                                                         album_meta)
+                if (s := stopped()):
+                    return s
+                retry_later = self._retry_later
+                if ok == 0:
+                    self._clear_download_folder(initial_folder)
+                    if retry_later:
+                        self._log("[X] No pakartot.lt tracks downloaded; running the link again "
+                                  "tries them.", tag="warning")
+                        return "incomplete"
+                    self._log("[+] No pakartot.lt tracks could be downloaded.")
+                    self._set_status(f"{qp}Nothing new.")
+                    return "done"
             else:
-                if not self._confirm_estimate(entries, workers):
-                    self._log("[X] User declined the estimate. Aborting.")
-                    self._set_status("Aborted.")
-                    return "cancelled"
-            self._check_free_space(output_base)
+                self._stage = "listing"
+                self._set_status(f"{qp}Extracting playlist info...")
+                self._log(f"[*] Fetching info for: {url}")
+                info = self._extract_info(url)
+                if info is None:
+                    # Stop and Skip kill the listing, which then has nothing to return.
+                    return stopped() or "failed"
+                if (s := stopped()):
+                    return s
+                # yt-dlp stopped listing part-way (_extract_info): what it found is
+                # run, but the link is not done in full, and its count is not the
+                # link's count.
+                cut_short = bool(info.get("cut_short"))
 
-            # 2. Make download folder (path was resolved above for the cleanup check)
-            initial_folder.mkdir(parents=True, exist_ok=True)
-            self._log(f"[+] Download folder: {initial_folder}")
+                channel_name_raw = (
+                    info.get("channel")
+                    or info.get("uploader")
+                    or info.get("title")
+                    or "channel"
+                )
+                channel_name = sanitize_name(channel_name_raw)
+                # Handle for naming pklz files — prefer the @handle from the URL,
+                # fall back to the channel name yt-dlp reported.
+                pklz_prefix = extract_handle(url, fallback=channel_name_raw)
+                entries = [e for e in (info.get("entries") or []) if e]
+                # A single video lists as one entry with no playlist title.
+                single = not entries or (len(entries) == 1 and not info.get("title"))
+                if not entries:
+                    entries = [info]  # single video fallback
+                # The listing just done is a fresh count for the list.
+                if not cut_short:
+                    self.root.after(0, self._record_count, url, len(entries), single)
 
-            self._log("[+] Audio mode: native m4a/opus (no transcode, fast)")
+                self._log(f"[+] Source: {channel_name_raw}  ({len(entries)} item(s))")
+                if (s := stopped()):
+                    return s
+                listed = len(entries)
+                # Settings, Downloads: items outside the length limits, and items
+                # fingerprinted in an earlier run, are left out here.
+                entries = self._filter_entries(entries)
+                if queue_mode:
+                    # The row's counter: what was left out has nothing left to do;
+                    # each download adds one as it ends (_download_parallel).
+                    base = listed - len(entries)
+                    # A listing cut short is not the link's count: count against
+                    # the last full count instead.
+                    total = listed if not cut_short else max(
+                        listed, int((self.queue_counts.get(url) or {}).get("n") or 0))
+                    self._item_progress = {"url": url, "done": base, "total": total, "base": base}
+                    self.root.after(0, self._update_count_label, url)
+                if not entries:
+                    self._log(f"[+] {qp}Nothing new to download for this link.")
+                    self._set_status(f"{qp}Nothing new.")
+                    return "incomplete" if cut_short else "done"
 
-            # 3. Parallel download (uses the same `workers` value shown in the estimate)
-            self._stage = "download"
-            self._set_status(f"{qp}Downloading 0/{len(entries)} ({workers} at once)...")
-            ok, fail = self._download_parallel(entries, initial_folder, workers)
-            self._log(f"[+] Downloads finished: {ok} OK, {fail} failed.")
+                # Resolve this channel's download subfolder now (needed for the
+                # pre-download cleanup check below).
+                target_folder_name = f"{channel_name}_subfolder"
+                initial_folder = output_base / target_folder_name
 
-            if (s := stopped()):
-                return s
-            self._advise_on_failures()
-            if ok == 0:
-                self._log("[X] No successful downloads. Aborting before fingerprinting.")
-                return "failed"
-            retry_later = self._retry_later
-            if not self._downloaded_ok:
-                # Every item that came through was outside the length limits
-                # (yt-dlp's own check), so, as with "Nothing new", there is
-                # nothing to fingerprint.
-                self._log(f"[+] {qp}Nothing to fingerprint: every item was outside the length "
-                          f"limits in Settings.")
-                self._final_items(ok)
-                self._clear_download_folder(initial_folder)
-                self._set_status(f"{qp}Nothing new.")
-                return "incomplete" if retry_later or cut_short else "done"
+                # 1.5 Pre-download cleanup: if this channel's subfolder already has
+                #     content (e.g. a leftover partial run), ask to clear it. This
+                #     runs in queue mode too — it only touches THIS channel's
+                #     subfolder, never other channels' folders.
+                if initial_folder.is_dir():
+                    if restarting:
+                        # Left by the run that stopped in this link; it starts over.
+                        self._log("[*] Clearing what the stopped run left in this link's download folder.")
+                        self._clear_download_folder(initial_folder)
+                    elif not self._preflight_clean(
+                        initial_folder, ("",), label_for_root="download folder",
+                    ):
+                        return "cancelled"
+
+                # 1a. Subset selection — interactive only outside queue mode.
+                #     In queue mode we download everything (can't cherry-pick
+                #     unattended across many channels).
+                if not queue_mode and len(entries) > 1:
+                    selected = self._select_subset(entries)
+                    if selected is None:
+                        self._log("[X] Selection cancelled. Aborting.")
+                        self._set_status("Aborted.")
+                        return "cancelled"
+                    if not selected:
+                        self._log("[X] Nothing selected. Aborting.")
+                        self._set_status("Aborted.")
+                        return "failed"
+                    if len(selected) != len(entries):
+                        self._log(
+                            f"[+] Selection: {len(selected)} of {len(entries)} item(s) "
+                            f"({len(entries) - len(selected)} skipped)."
+                        )
+                    entries = selected
+
+                # 1b. Size/time estimate — interactive only outside queue mode.
+                # Clamped here as well: a Spinbox's range does not stop typed values.
+                workers = min(self.MAX_PARALLEL,
+                              self._safe_int(self.parallel_var, self.DEFAULT_PARALLEL))
+                if queue_mode:
+                    self._confirm_estimate(entries, workers, log_only=True)
+                else:
+                    if not self._confirm_estimate(entries, workers):
+                        self._log("[X] User declined the estimate. Aborting.")
+                        self._set_status("Aborted.")
+                        return "cancelled"
+                self._check_free_space(output_base)
+
+                # 2. Make download folder (path was resolved above for the cleanup check)
+                initial_folder.mkdir(parents=True, exist_ok=True)
+                self._log(f"[+] Download folder: {initial_folder}")
+
+                self._log("[+] Audio mode: native m4a/opus (no transcode, fast)")
+
+                # 3. Parallel download (uses the same `workers` value shown in the estimate)
+                self._stage = "download"
+                self._set_status(f"{qp}Downloading 0/{len(entries)} ({workers} at once)...")
+                ok, fail = self._download_parallel(entries, initial_folder, workers)
+                self._log(f"[+] Downloads finished: {ok} OK, {fail} failed.")
+
+                if (s := stopped()):
+                    return s
+                self._advise_on_failures()
+                if ok == 0:
+                    self._log("[X] No successful downloads. Aborting before fingerprinting.")
+                    return "failed"
+                retry_later = self._retry_later
+                if not self._downloaded_ok:
+                    # Every item that came through was outside the length limits
+                    # (yt-dlp's own check), so, as with "Nothing new", there is
+                    # nothing to fingerprint.
+                    self._log(f"[+] {qp}Nothing to fingerprint: every item was outside the length "
+                              f"limits in Settings.")
+                    self._final_items(ok)
+                    self._clear_download_folder(initial_folder)
+                    self._set_status(f"{qp}Nothing new.")
+                    return "incomplete" if retry_later or cut_short else "done"
 
             # 4. Folder stays where it was downloaded; the scan below picks it up there.
             self._log(f"[+] Folder stays at: {initial_folder}")
@@ -7812,6 +8589,617 @@ class FingerprinterApp:
         meta["entries"] = entries
         meta["cut_short"] = cut_short
         return meta
+
+    # ---- WatZatSong range downloads -----------------------------------------
+    # watzatsong.com is not a yt-dlp site, so a range of sample IDs is fetched
+    # here instead and then handed to the same split + fingerprint tail as a
+    # normal link. See the module-level wzs_* helpers for the URL shapes.
+
+    def _wzs_delay_seconds(self) -> float:
+        """The wait between WatZatSong samples, in seconds, from Settings,
+        Downloads (clamped to 0..WZS_MAX_DELAY_MS). The user may have emptied
+        the box, so _safe_int gives the default back."""
+        ms = self._safe_int(self.wzs_delay_var, self.WZS_DEFAULT_DELAY_MS, minimum=0)
+        return min(self.WZS_MAX_DELAY_MS, ms) / 1000.0
+
+    def _cookie_opener(self, site_label: str) -> "urllib.request.OpenerDirector":
+        """A urllib opener carrying the cookies of the browser chosen in
+        Settings, Downloads, for a site that is not a yt-dlp site and needs a
+        signed-in session (WatZatSong behind Cloudflare, pakartot.lt's track
+        API). `site_label` only names the site in the log. Built once per
+        browser setting and cached on self; rebuilt when the setting changes."""
+        browser = self.cookies_browser_var.get().strip()
+        cache = getattr(self, "_cookie_opener_cache", None)
+        if cache is not None and cache[0] == browser:
+            return cache[1]
+
+        import http.cookiejar
+        jar = http.cookiejar.CookieJar()
+        if browser and browser != COOKIE_BROWSERS[0]:
+            try:
+                from yt_dlp.cookies import extract_cookies_from_browser
+                jar = extract_cookies_from_browser(browser.lower())
+                self._log(f"[+] {site_label}: using cookies from {browser}.")
+            except Exception as e:  # noqa: BLE001
+                self._log(f"[!] {site_label}: could not read {browser} cookies ({e}); "
+                          f"trying without a sign-in.", tag="warning")
+        else:
+            self._log(f"[!] {site_label}: no browser chosen under 'Sign in with cookies from' "
+                      "(Settings, Downloads). The site usually refuses without one.",
+                      tag="warning")
+        opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+        opener.addheaders = list(WZS_HEADERS.items())
+        self._cookie_opener_cache = (browser, opener)
+        return opener
+
+    def _wzs_opener(self) -> "urllib.request.OpenerDirector":
+        """The shared cookie opener, labelled for WatZatSong."""
+        return self._cookie_opener("WatZatSong")
+
+    # ---- pakartot.lt album/playlist downloads -------------------------------
+    # An album/playlist link is a normal URL, so it flows through the queue
+    # like any link; _run_pipeline sends it here instead of to yt-dlp. See the
+    # module-level pakartot_* helpers for the URL shapes and the play API.
+
+    def _pakartot_opener(self) -> "urllib.request.OpenerDirector":
+        """The shared cookie opener, labelled for pakartot.lt."""
+        return self._cookie_opener("pakartot.lt")
+
+    def _pakartot_tracks(self, url: str) -> dict | None:
+        """Resolve a pakartot.lt album/playlist link to its tracks. Returns
+        {"tracks": [...], "title", "artist", "kind"} or None when it could not
+        (no such page, not signed in, a network error). Each track dict keeps
+        the API's fields (filename, title, artist, length, tid)."""
+        kind = pakartot_kind(url)
+        if kind is None:
+            return None
+        opener = self._pakartot_opener()
+        # 1. The page, to read the "play all" button's id (data-id on
+        #    a.play-release). It is there whether or not you are signed in.
+        try:
+            with opener.open(url, timeout=30) as resp:
+                page = resp.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as e:
+            if e.code in (404, 410):
+                self._log(f"[X] pakartot.lt: no such page (HTTP {e.code}).", tag="warning")
+                return None
+            self._log(f"[!] pakartot.lt: HTTP {e.code} fetching the page.", tag="warning")
+            return {"_retry": True}
+        except Exception as e:  # noqa: BLE001
+            self._log(f"[!] pakartot.lt: {e}.", tag="warning")
+            return {"_retry": True}
+
+        m = re.search(r'class="[^"]*play-release[^"]*"[^>]*\bdata-id="(\d+)"', page) \
+            or re.search(r'\bdata-id="(\d+)"[^>]*class="[^"]*play-release[^"]*"', page)
+        if not m:
+            self._log("[X] pakartot.lt: could not find the album's play button on the page "
+                      "(the site's markup may have changed).", tag="warning")
+            return None
+        play_id = m.group(1)
+
+        # 2. The track list from the play API. type is aid for an album, pid
+        #    for a playlist. Logged out it answers {"result":false,
+        #    "info":"no_login"}.
+        type_param = "pid" if kind == "playlist" else "aid"
+        body = urllib.parse.urlencode({"type": type_param, "id": play_id}).encode()
+        req = urllib.request.Request(
+            PAKARTOT_PLAY_API, data=body,
+            headers={"Content-Type": "application/x-www-form-urlencoded",
+                     "X-Requested-With": "XMLHttpRequest", "Referer": url})
+        try:
+            with opener.open(req, timeout=30) as resp:
+                data = json.loads(resp.read().decode("utf-8", "replace"))
+        except Exception as e:  # noqa: BLE001
+            self._log(f"[!] pakartot.lt: {e} fetching the track list.", tag="warning")
+            return {"_retry": True}
+
+        if not isinstance(data, dict) or not data.get("result"):
+            if isinstance(data, dict) and data.get("info") == "no_login":
+                self._log("[X] pakartot.lt: not signed in. Choose your browser under "
+                          "'Sign in with cookies from' (Settings, Downloads) and sign in "
+                          "to pakartot.lt there; Firefox works most reliably.", tag="warning")
+                return {"_retry": True}
+            self._log("[X] pakartot.lt: the track list could not be read.", tag="warning")
+            return {"_retry": True}
+        tracks = [t for t in (data.get("info") or []) if isinstance(t, dict)]
+
+        # Page title/artist for naming (best effort; the pklz name falls back
+        # to the slug if these are not found).
+        title = self._pakartot_text(page, r'class="m-album-title"[^>]*>([^<]+)') or ""
+        artist = self._pakartot_text(page, r'class="m-greytitle"[^>]*>([^<]+)') or ""
+        # The album cover's address (div.m-item-cover2 > img), for the cover-art
+        # option. Taken straight from the page like the userscript.
+        cover = ""
+        cm = re.search(r'class="[^"]*m-item-cover2[^"]*"[\s\S]{0,200}?<img[^>]*\bsrc="([^"]+)"',
+                       page)
+        if cm:
+            import html
+            cover = html.unescape(cm.group(1)).strip()
+        return {"tracks": tracks, "title": title.strip(), "artist": artist.strip(),
+                "kind": kind, "cover": cover}
+
+    @staticmethod
+    def _pakartot_text(page: str, pattern: str) -> str:
+        """First capture of `pattern` in `page`, HTML-unescaped and trimmed, or ""."""
+        m = re.search(pattern, page)
+        if not m:
+            return ""
+        import html
+        return html.unescape(m.group(1)).strip()
+
+    def _pakartot_project_albums(self, url: str) -> list[str] | None:
+        """The album links on an artist (project) page, in order. None on a
+        fetch error (worth retrying); an empty list when the page simply lists
+        no albums. The page is public, so this does not need a sign-in (the
+        albums themselves do, when they download)."""
+        try:
+            with self._pakartot_opener().open(url, timeout=30) as resp:
+                page = resp.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as e:
+            if e.code in (404, 410):
+                self._log(f"[X] pakartot.lt: no such artist page (HTTP {e.code}).",
+                          tag="warning")
+                return []
+            self._log(f"[!] pakartot.lt: HTTP {e.code} fetching the artist page.", tag="warning")
+            return None
+        except Exception as e:  # noqa: BLE001
+            self._log(f"[!] pakartot.lt: {e} fetching the artist page.", tag="warning")
+            return None
+        return pakartot_album_links(page)
+
+    # The comment stamped on every pakartot.lt download (the user asked for it
+    # in Lithuanian: "Source: pakartot.lt").
+    PAKARTOT_COMMENT = "Šaltinis: pakartot.lt"
+
+    def _pakartot_download_one(self, track: dict, index: int, target_folder: Path,
+                               album_meta: dict | None = None) -> str:
+        """Download one track into `target_folder`. Returns "ok", "missing"
+        (no audio URL) or "retry" (a network error). Named NN_artist_title.mp3
+        as the pakartot downloader does. The saved file is then stamped with
+        its title/artist/album and the comment "Šaltinis: pakartot.lt"
+        (non-fatal: a tag that fails leaves the untagged file in place)."""
+        audio_url = pakartot_track_url(track.get("filename") or "")
+        if not audio_url:
+            return "missing"
+        # The file keeps its real title, Lithuanian or Russian letters and all;
+        # the subfolder and .pklz are still the ASCII sanitize_name versions.
+        artist = str(track.get("artist") or "").strip() or "Unknown"
+        title = str(track.get("title") or "").strip() or "Track"
+        base = safe_filename_unicode(f"{index:02d} {artist} - {title}",
+                                     fallback=f"track_{index:02d}")[:150]
+        ext = os.path.splitext(urlsplit(audio_url).path)[1].lower()
+        if ext not in (".mp3", ".m4a", ".ogg", ".oga", ".wav", ".aac", ".opus"):
+            ext = ".mp3"
+        dest = target_folder / f"{base}{ext}"
+        req = urllib.request.Request(audio_url, headers={
+            "Referer": f"{PAKARTOT_BASE}/", "Origin": PAKARTOT_BASE})
+        try:
+            with self._pakartot_opener().open(req, timeout=120) as resp:
+                data = resp.read()
+        except urllib.error.HTTPError as e:
+            if e.code in (404, 410):
+                return "missing"
+            self._log(f"[!] pakartot.lt: track {index} HTTP {e.code}.", tag="warning")
+            return "retry"
+        except Exception as e:  # noqa: BLE001
+            self._log(f"[!] pakartot.lt: track {index} {e}.", tag="warning")
+            return "retry"
+        if not data:
+            return "missing"
+        try:
+            dest.write_bytes(data)
+        except OSError as e:
+            self._log(f"[!] pakartot.lt: track {index} could not be saved ({e}).", tag="warning")
+            return "retry"
+        self._pakartot_tag_file(dest, track, index, album_meta or {})
+        return "ok"
+
+    def _pakartot_tag_file(self, path: Path, track: dict, index: int,
+                           album_meta: dict) -> None:
+        """Stamp `path` with its metadata and the "Šaltinis: pakartot.lt"
+        comment using ffmpeg stream-copy (no re-encode), writing to a scratch
+        name and moving it into place only if ffmpeg succeeds. Any failure is
+        logged and the original file is left as it was: the comment is a nicety,
+        not worth losing a download over."""
+        ext = path.suffix.lower()
+        fmt = SPLIT_MUXERS.get(ext, ext.lstrip("."))
+        if not fmt:
+            return
+        meta = {
+            "title": str(track.get("title") or "").strip(),
+            "artist": str(track.get("artist") or album_meta.get("artist") or "").strip(),
+            "album": str(album_meta.get("title") or "").strip(),
+            "track": str(index),
+            "comment": self.PAKARTOT_COMMENT,
+        }
+        tmp = path.with_suffix(path.suffix + ".tag")
+        cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+               "-i", str(path), "-map", "0", "-c", "copy"]
+        for key, value in meta.items():
+            if value:
+                cmd += ["-metadata", f"{key}={value}"]
+        cmd += ["-f", fmt, str(tmp)]
+        try:
+            proc = subprocess.run(
+                cmd, capture_output=True, text=True, check=False,
+                encoding="utf-8", errors="replace",
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            if proc.returncode == 0 and tmp.is_file() and tmp.stat().st_size > 0:
+                os.replace(tmp, path)
+            else:
+                tmp.unlink(missing_ok=True)
+                err = (proc.stderr or "").strip()[:160]
+                self._log(f"[!] pakartot.lt: could not tag {path.name}"
+                          + (f" ({err})" if err else "") + "; kept untagged.", tag="warning")
+        except Exception as e:  # noqa: BLE001
+            tmp.unlink(missing_ok=True)
+            self._log(f"[!] pakartot.lt: could not tag {path.name} ({e}); kept untagged.",
+                      tag="warning")
+
+    def _pakartot_download_cover(self, cover_src: str, covers_dir: Path, name: str) -> None:
+        """Save an album's cover to <covers_dir>/<name>.<ext> (Settings,
+        Downloads: Download pakartot.lt cover art). `cover_src` is the page's
+        thumbnail address; the largest size is fetched. Non-fatal: a cover that
+        cannot be fetched only logs."""
+        url = pakartot_cover_url(cover_src)
+        if not url:
+            self._log("[!] pakartot.lt: no cover art on this album.", tag="warning")
+            return
+        ext = os.path.splitext(urlsplit(url).path)[1].lower()
+        if ext not in (".jpg", ".jpeg", ".png", ".gif", ".webp"):
+            ext = ".jpg"
+        req = urllib.request.Request(url, headers={"Referer": f"{PAKARTOT_BASE}/"})
+        try:
+            with self._pakartot_opener().open(req, timeout=60) as resp:
+                data = resp.read()
+            if not data:
+                self._log("[!] pakartot.lt: the cover art came back empty.", tag="warning")
+                return
+            covers_dir.mkdir(parents=True, exist_ok=True)
+            dest = covers_dir / f"{safe_filename_unicode(name, 'cover')[:150]}{ext}"
+            dest.write_bytes(data)
+            self._log(f"[+] pakartot.lt: cover art saved to {dest}.")
+        except Exception as e:  # noqa: BLE001
+            self._log(f"[!] pakartot.lt: could not save the cover art ({e}).", tag="warning")
+
+    def _pakartot_download_stage(
+        self, tracks: list[dict], initial_folder: Path, queue_mode: bool, url: str,
+        album_meta: dict | None = None,
+    ) -> tuple[int, int]:
+        """Download every track into `initial_folder`, one at a time with the
+        Settings delay between them, honouring Pause, Skip and Stop. Fills
+        self._downloaded_ok and self._retry_later like the WatZatSong stage.
+        Each file is tagged with its metadata and the pakartot.lt comment.
+        Returns (ok, fail)."""
+        total = len(tracks)
+        delay = self._wzs_delay_seconds()
+        self._downloaded_ok = []
+        self._retry_later = 0
+        ok = fail = missing = 0
+        self.root.after(0, self._init_slots, 1)
+        self._set_progress("Downloading", 0, total)
+
+        for i, track in enumerate(tracks, start=1):
+            self._wait_if_paused()
+            if self.cancel_flag.is_set() or self.skip_flag.is_set():
+                break
+            label = str(track.get("title") or f"track {i}")
+            self._update_slot(0, f"pakartot.lt: {label}", "downloading")
+            status = self._pakartot_download_one(track, i, initial_folder, album_meta)
+            if status == "ok":
+                ok += 1
+                tid = track.get("tid")
+                self._downloaded_ok.append({
+                    "id": str(tid) if tid is not None else f"n{i}",
+                    "extractor": "pakartot", "title": label,
+                })
+                prog = self._item_progress
+                if prog is not None:
+                    prog["done"] += 1
+                    self.root.after(0, self._update_count_label, prog["url"])
+            elif status == "retry":
+                fail += 1
+                self._retry_later += 1
+            else:
+                missing += 1
+            self._set_status(f"Downloading {i}/{total} (pakartot.lt)...")
+            self._set_progress("Downloading", i, total)
+            if i != total and delay > 0:
+                self._interruptible_sleep(delay)
+        self._update_slot(0, "", "idle")
+        self._log(f"[+] pakartot.lt: {ok} downloaded, {missing} missing, "
+                  f"{fail} failed (will retry on another run).")
+        return ok, fail
+
+    def _wzs_fetch_meta(self, sample_id: int) -> dict | None:
+        """The sample's JSON from /sample/<id>.html, or None when it is gone
+        (a removed id, a 404, a Cloudflare wall, or a reply that is not the
+        JSON expected). The body is JSON for a live sample; "Unknown sample"
+        marks one that no longer exists."""
+        url = f"{WZS_BASE}/sample/{sample_id}.html"
+        try:
+            with self._wzs_opener().open(url, timeout=30) as resp:
+                body = resp.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as e:
+            if e.code in (404, 410):
+                return None
+            self._log(f"[!] WatZatSong {sample_id}: HTTP {e.code}.", tag="warning")
+            return {"_http_error": e.code}
+        except Exception as e:  # noqa: BLE001
+            self._log(f"[!] WatZatSong {sample_id}: {e}.", tag="warning")
+            return {"_error": str(e)}
+        if "Unknown sample" in body:
+            return None
+        try:
+            data = json.loads(body)
+        except ValueError:
+            # Not JSON: usually a Cloudflare challenge page, which the
+            # userscript detects the same way. Report it as a soft error so
+            # the range can be retried later rather than counted as "missing".
+            if "cf_chl_opt" in body or "Just a moment" in body:
+                return {"_cloudflare": True}
+            return {"_error": "unexpected reply (not JSON)"}
+        return data if isinstance(data, dict) else None
+
+    def _wzs_download_one(self, sample_id: int, target_folder: Path,
+                          comments_dir: Path | None = None) -> str:
+        """Fetch one sample into `target_folder`. Returns a status:
+        "ok" (downloaded), "missing" (no such sample, or it has no audio) or
+        "retry" (a network error, rate limit or Cloudflare wall worth trying
+        again). The file is named like the userscript's:
+        WZS_<id>_by_<user>_<title>.mp3. When `comments_dir` is given and the
+        sample has comments, they are written there as a .txt of the same
+        name (Settings, Downloads: Also export WatZatSong comments)."""
+        meta = self._wzs_fetch_meta(sample_id)
+        # Stashed so the stage can build a status row and collect the poster
+        # without fetching the page a second time (None = removed sample).
+        self._wzs_last_meta = meta
+        if meta is None:
+            return "missing"
+        if meta.get("_cloudflare") or meta.get("_error") or meta.get("_http_error"):
+            return "retry"
+        # A deleted sample is still listed but has nothing to fetch.
+        if meta.get("deleted"):
+            return "missing"
+        mp3_url = wzs_mp3_url(meta)
+        if not mp3_url:
+            return "missing"
+
+        user = sanitize_name(str(meta.get("user", {}).get("login") or "")) if isinstance(
+            meta.get("user"), dict) else ""
+        title = sanitize_name(str(meta.get("comment") or meta.get("title") or "")) or "notitle"
+        parts = [f"WZS_{sample_id}"]
+        if user:
+            parts.append(f"by_{user}")
+        parts.append(title)
+        base = sanitize_name("_".join(parts))[:150] or f"WZS_{sample_id}"
+        # The sample's comments, alongside the audio, before the audio even
+        # downloads so a later failure does not lose them.
+        if comments_dir is not None:
+            self._wzs_write_comments(sample_id, meta, comments_dir, base)
+        # Keep the real extension when the address names one; .mp3 otherwise.
+        ext = os.path.splitext(urlsplit(mp3_url).path)[1].lower()
+        if ext not in (".mp3", ".m4a", ".ogg", ".oga", ".wav", ".aac", ".opus"):
+            ext = ".mp3"
+        dest = target_folder / f"{base}{ext}"
+
+        try:
+            with self._wzs_opener().open(mp3_url, timeout=60) as resp:
+                data = resp.read()
+        except urllib.error.HTTPError as e:
+            if e.code in (404, 410):
+                return "missing"
+            self._log(f"[!] WatZatSong {sample_id}: audio HTTP {e.code}.", tag="warning")
+            return "retry"
+        except Exception as e:  # noqa: BLE001
+            self._log(f"[!] WatZatSong {sample_id}: audio {e}.", tag="warning")
+            return "retry"
+        if not data:
+            return "missing"
+        try:
+            dest.write_bytes(data)
+        except OSError as e:
+            self._log(f"[!] WatZatSong {sample_id}: could not save ({e}).", tag="warning")
+            return "retry"
+        return "ok"
+
+    def _wzs_write_comments(self, sample_id: int, meta: dict, comments_dir: Path,
+                            base_name: str) -> None:
+        """Write a sample's comments to <comments_dir>/<base_name>_comments.txt,
+        or do nothing when it has none. A write that fails only logs: the
+        download goes on. self._wzs_comments counts what was written, for the
+        link's report."""
+        text = wzs_format_comments(sample_id, meta)
+        if not text:
+            return
+        try:
+            comments_dir.mkdir(parents=True, exist_ok=True)
+            (comments_dir / f"{base_name}_comments.txt").write_text(text, encoding="utf-8")
+            self._wzs_comments += 1
+        except OSError as e:
+            self._log(f"[!] WatZatSong {sample_id}: could not save comments ({e}).",
+                      tag="warning")
+
+    def _wzs_download_stage(
+        self, url: str, initial_folder: Path, queue_mode: bool,
+        item_total: int, comments_dir: Path | None = None,
+        exports: dict | None = None,
+    ) -> tuple[int, int]:
+        """Download every sample in a wzs: range into `initial_folder`, one at
+        a time with the Settings delay between them (_wzs_delay_seconds),
+        honouring Pause, Skip and Stop. Fills self._downloaded_ok (one light
+        entry per saved file, for the shared tail's bookkeeping) and
+        self._retry_later. When `comments_dir` is given, each sample's comments
+        are written there too. `exports` turns on the status CSV/TXT and the
+        user-picture downloads (keys: status_dir, want_csv, want_txt,
+        pics_dir); all three come from the one page fetch per sample.
+        Returns (ok, fail)."""
+        rng = wzs_range(url)
+        assert rng is not None
+        start, end = rng
+        total = end - start + 1
+        delay = self._wzs_delay_seconds()
+        exports = exports or {}
+        collecting = bool(exports.get("want_csv") or exports.get("want_txt")
+                          or exports.get("pics_dir"))
+        self._downloaded_ok = []
+        self._retry_later = 0
+        self._wzs_comments = 0
+        status_rows: list[dict] = []
+        posters: list[str] = []           # unique sample-poster logins, in order
+        seen_posters: set[str] = set()
+        ok = fail = missing = 0
+        self.root.after(0, self._init_slots, 1)
+        self._set_progress("Downloading", 0, total)
+
+        for i, sample_id in enumerate(range(start, end + 1)):
+            self._wait_if_paused()
+            if self.cancel_flag.is_set() or self.skip_flag.is_set():
+                break
+            self._update_slot(0, f"WatZatSong sample {sample_id}", "downloading")
+            status = self._wzs_download_one(sample_id, initial_folder, comments_dir)
+            if collecting:
+                meta = getattr(self, "_wzs_last_meta", None)
+                if exports.get("want_csv") or exports.get("want_txt"):
+                    status_rows.append(wzs_status_row(sample_id, meta))
+                if exports.get("pics_dir") and isinstance(meta, dict):
+                    login = str((meta.get("user") or {}).get("login") or "").strip() \
+                        if isinstance(meta.get("user"), dict) else ""
+                    if login and login.lower() not in seen_posters:
+                        seen_posters.add(login.lower())
+                        posters.append(login)
+            if status == "ok":
+                ok += 1
+                # The shared tail counts these; the extractor/id let the done
+                # list and unreadable-file accounting work as for a yt-dlp item.
+                self._downloaded_ok.append({
+                    "id": str(sample_id), "extractor": "watzatsong",
+                    "title": f"WZS {sample_id}",
+                })
+                prog = self._item_progress
+                if prog is not None:
+                    prog["done"] += 1
+                    self.root.after(0, self._update_count_label, prog["url"])
+            elif status == "retry":
+                fail += 1
+                self._retry_later += 1
+            else:
+                missing += 1
+            done = i + 1
+            self._set_status(f"Downloading {done}/{total} (WatZatSong)...")
+            self._set_progress("Downloading", done, total)
+            if sample_id != end and delay > 0:
+                self._interruptible_sleep(delay)
+        self._update_slot(0, "", "idle")
+        self._log(f"[+] WatZatSong: {ok} downloaded, {missing} missing/empty, "
+                  f"{fail} failed (will retry on another run).")
+        if comments_dir is not None:
+            self._log(f"[+] WatZatSong: {self._wzs_comments} sample(s) had comments, saved to "
+                      f"{comments_dir}.")
+        # The status export and the user pictures, from what was gathered above.
+        if status_rows and (exports.get("want_csv") or exports.get("want_txt")):
+            self._wzs_write_status(status_rows, start, end, exports)
+        if posters and exports.get("pics_dir"):
+            self._wzs_download_userpics(posters, exports["pics_dir"], delay)
+        return ok, fail
+
+    def _wzs_write_status(self, rows: list[dict], start: int, end: int,
+                          exports: dict) -> None:
+        """Write the sample-status rows as CSV and/or TXT, with a timestamp in
+        each file name, into exports["status_dir"]. Failures only log."""
+        status_dir: Path = exports["status_dir"]
+        stamp = time.strftime("%Y-%m-%d_%H%M%S")
+        base = f"WZS_IDRange_{start}-{end}_{stamp}"
+        try:
+            status_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            self._log(f"[!] WatZatSong: could not make the status folder ({e}).", tag="warning")
+            return
+        if exports.get("want_csv"):
+            try:
+                (status_dir / f"{base}.csv").write_text(
+                    wzs_status_csv(rows), encoding="utf-8-sig")
+                self._log(f"[+] WatZatSong: statuses saved to {status_dir / (base + '.csv')}.")
+            except OSError as e:
+                self._log(f"[!] WatZatSong: could not write the status CSV ({e}).", tag="warning")
+        if exports.get("want_txt"):
+            try:
+                (status_dir / f"{base}.txt").write_text(
+                    wzs_status_txt(rows, start, end), encoding="utf-8")
+                self._log(f"[+] WatZatSong: statuses saved to {status_dir / (base + '.txt')}.")
+            except OSError as e:
+                self._log(f"[!] WatZatSong: could not write the status TXT ({e}).", tag="warning")
+
+    def _wzs_download_userpics(self, logins: list[str], pics_dir: Path, delay: float) -> None:
+        """Download each poster's profile picture (WatZatSong upload, or the
+        Google/Facebook avatar it links to), keeping its real image format,
+        into `pics_dir`. The default avatar is skipped. One profile fetch per
+        unique user; honours Pause, Skip and Stop and waits `delay` between
+        fetches."""
+        self._set_status(f"WatZatSong: user pictures (0/{len(logins)})...")
+        got = skipped = 0
+        for i, login in enumerate(logins, start=1):
+            self._wait_if_paused()
+            if self.cancel_flag.is_set() or self.skip_flag.is_set():
+                break
+            self._update_slot(0, f"WatZatSong user picture: {login}", "downloading")
+            if self._wzs_download_one_userpic(login, pics_dir):
+                got += 1
+            else:
+                skipped += 1
+            self._set_status(f"WatZatSong: user pictures ({i}/{len(logins)})...")
+            if i != len(logins) and delay > 0:
+                self._interruptible_sleep(delay)
+        self._update_slot(0, "", "idle")
+        self._log(f"[+] WatZatSong: {got} user picture(s) saved, {skipped} without one, "
+                  f"to {pics_dir}.")
+
+    def _wzs_download_one_userpic(self, login: str, pics_dir: Path) -> bool:
+        """Fetch one user's profile page, find their picture (WZS/Google/
+        Facebook) and save it keeping its real format. True when a file was
+        written; False for the default avatar or any error."""
+        profile = f"{WZS_BASE}/en/profile/{urllib.parse.quote(login)}"
+        try:
+            with self._wzs_opener().open(profile, timeout=30) as resp:
+                page = resp.read().decode("utf-8", "replace")
+        except Exception as e:  # noqa: BLE001
+            self._log(f"[!] WatZatSong: {login} profile {e}.", tag="warning")
+            return False
+        found = wzs_profile_picture_url(login, page)
+        if found is None:
+            return False       # default avatar, nothing to save
+        pic_url, source = found
+        try:
+            with self._wzs_opener().open(
+                urllib.request.Request(pic_url, headers={"Referer": f"{WZS_BASE}/"}),
+                timeout=60) as resp:
+                data = resp.read()
+        except Exception as e:  # noqa: BLE001
+            self._log(f"[!] WatZatSong: {login} picture ({source}) {e}.", tag="warning")
+            return False
+        if not data:
+            return False
+        ext = image_ext_from_bytes(data, ".jpg")
+        stamp = time.strftime("%Y-%m-%d_%H%M%S")
+        name = safe_filename_unicode(f"WZS userpic of {login} {source} {stamp}",
+                                     fallback=f"userpic_{stamp}")[:150]
+        try:
+            pics_dir.mkdir(parents=True, exist_ok=True)
+            (pics_dir / f"{name}{ext}").write_bytes(data)
+            return True
+        except OSError as e:
+            self._log(f"[!] WatZatSong: could not save {login} picture ({e}).", tag="warning")
+            return False
+
+    def _interruptible_sleep(self, seconds: float) -> None:
+        """Sleep in small steps so Stop and Skip are felt at once; Pause holds
+        here too, as elsewhere work is started."""
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            if self.cancel_flag.is_set() or self.skip_flag.is_set():
+                return
+            self._wait_if_paused()
+            time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
 
     def _download_parallel(
         self,

@@ -13,9 +13,11 @@ songs with [WerZatSong](https://github.com/Nel80s/WerZatSong) and
 
 Give it links to channels, playlists or single pages on YouTube, Archive.org,
 Mixcloud, SoundCloud or [any other site yt-dlp
-supports](https://github.com/yt-dlp/yt-dlp/blob/master/supportedsites.md). It
-downloads the audio, splits long recordings, and fingerprints everything in
-batches with WerZatSong's version of audfprint.
+supports](https://github.com/yt-dlp/yt-dlp/blob/master/supportedsites.md), a
+[pakartot.lt](https://www.pakartot.lt) album or playlist, or a range of
+[WatZatSong](https://www.watzatsong.com) sample IDs. It downloads the audio,
+splits long recordings, and fingerprints everything in batches with
+WerZatSong's version of audfprint.
 
 **Windows only.** Setup is a batch file, and the tools it installs are Windows
 builds.
@@ -118,6 +120,80 @@ The folders are already set: audio downloads to `downloads\` and
 finished fingerprints are kept in `pklz-files\`, both in the program folder.
 The status bar at the bottom always shows where fingerprints go; click it to
 open that folder, and change it in **Settings** if you want them elsewhere.
+
+### pakartot.lt albums, playlists and artists
+
+[pakartot.lt](https://www.pakartot.lt) is not a yt-dlp site either, but its
+pages are added as ordinary links: paste one into the **Link** box and press
+**Add**, like any other. Three kinds of page work:
+
+- an **album** — `pakartot.lt/album/<name>`;
+- a **playlist** — `pakartot.lt/playlist/<name>`;
+- an **artist** — `pakartot.lt/project/<name>`: every album on that artist's
+  page is fetched, each as its own album.
+
+The program reads the page, asks pakartot.lt's player for the track list, and
+downloads every track into the pipeline. Each album goes into its own folder
+and its own `.pklz`, named after the album's artist and title, so an artist
+page gives one fingerprint file per album rather than one big mix. The audio
+files keep their real titles, Lithuanian or Russian letters and all (the folder
+and `.pklz` names are still plain ASCII). Every downloaded file is tagged with
+its title, artist and album and carries the comment **Šaltinis: pakartot.lt**.
+Turn on **Download pakartot.lt cover art** (Settings, Downloads) to also save
+each album's cover image, beside the fingerprints in a `pakartot-covers`
+folder.
+
+pakartot.lt needs you to be signed in, so choose your browser under **Sign in
+with cookies from** (Settings, Downloads) and sign in to pakartot.lt there
+first; Firefox works most reliably. Without a sign-in the site returns no
+tracks and the link counts as incomplete, so running it again fetches them
+once you have signed in. Single-track pages (`/album/<name>/<track>`) are not
+supported; add the album instead.
+
+### WatZatSong sample ranges
+
+[WatZatSong](https://www.watzatsong.com) is not a yt-dlp site, so its samples
+are added by their ID range instead of a link. Each sample has a number (the
+one in a `watzatsong.com/en/name-that-tune/<id>` page), and the numbers run in
+order, so a block of them is a range from one ID to another.
+
+1. Fill in the **WatZatSong IDs** boxes in the toolbar: the first sample's ID
+   in the left box, the last in the right (leave the right box empty to add
+   just the one), and press **Add range**.
+2. It joins the list as one entry, for example `WatZatSong IDs 100-200`, and
+   runs with **Download and fingerprint** like any other link: the samples are
+   downloaded, split and fingerprinted the same way, into a `.pklz` named after
+   the range.
+
+The samples are fetched one at a time, half a second apart by default (change
+it under **Settings**, Downloads). A very large range asks first. The site
+needs you to be signed in: choose your browser under **Sign in with cookies
+from** (Settings, Downloads) before you start, the same setting yt-dlp uses for
+other sites. Firefox works most reliably; a Chromium browser (Chrome, Edge)
+has to be fully closed first, and even then its newest builds can refuse to
+hand over cookies. Samples that no longer exist are skipped; if the site
+refuses them (it does without a sign-in), the range counts as incomplete, so
+running it again fetches the rest.
+
+Turn on **Also export WatZatSong comments** (Settings, Downloads) to save each
+sample's comments as a text file in a `WZS-comments` folder beside the
+fingerprints: the time of each comment, who wrote it and what they said. It
+only applies to WatZatSong ranges, and the files stay even though the
+downloaded audio is deleted after fingerprinting.
+
+Three more range options (Settings, Downloads), all gathered from the same
+page the range already reads, so they cost no extra fetches:
+
+- **Export WatZatSong sample statuses to CSV** and **...to TXT** — a record of
+  every sample in the range (active, removed, deleted or closed, with its
+  proposals, comments, poster and date), written to a `WZS-status` folder.
+  Each file name carries the range and a timestamp, so successive runs do not
+  overwrite each other.
+- **Download WatZatSong user pictures** — each sample poster's profile picture,
+  into a `WZS-userpics` folder, kept in its real format (JPEG, PNG, GIF or
+  WebP). If their avatar is a linked Google or Facebook picture, that is
+  fetched instead; the default avatar is skipped, and each poster is fetched
+  once.
 
 The window has three panels, and the dividers between them can be dragged:
 
@@ -308,7 +384,13 @@ you last left it.
 | Folders | Keep downloaded audio in | Off, `audio\` | Keeps a copy of each link's downloads, as they were downloaded (before splitting), in a folder named after the channel. On the same drive this takes no extra space. |
 | Downloads | Name downloaded files | `%(title)s [%(id)s].%(ext)s` | A yt-dlp [output template](https://github.com/yt-dlp/yt-dlp#output-template). |
 | Downloads | Extra download options | empty | Passed to yt-dlp, split at spaces as on a command line. Put quotes around a value with spaces in it, such as a path: `--cookies "C:\Users\Jane Doe\cookies.txt"`. |
-| Downloads | Sign in with cookies from | None | A browser whose login yt-dlp uses. See [Content that needs a login](#content-that-needs-a-login). |
+| Downloads | Sign in with cookies from | None | A browser whose login yt-dlp uses. [pakartot.lt](#pakartotlt-albums-playlists-and-artists) and [WatZatSong](#watzatsong-sample-ranges) use it too, and need it. See [Content that needs a login](#content-that-needs-a-login). |
+| Downloads | Wait between WatZatSong samples | 500 ms | The pause between one [WatZatSong](#watzatsong-sample-ranges) sample and the next (that site is fetched one sample at a time, not several at once). Raise it if the site starts refusing samples; it does not affect yt-dlp downloads. |
+| Downloads | Also export WatZatSong comments | Off | For each [WatZatSong](#watzatsong-sample-ranges) sample that has comments, save them as a text file (the time, who wrote it and what they said) in a `WZS-comments` folder next to the fingerprints. Only WatZatSong ranges use it. |
+| Downloads | Export WatZatSong sample statuses to CSV | Off | For a [WatZatSong](#watzatsong-sample-ranges) ID range, save a CSV of each sample's status (active, removed, deleted, closed), proposals, comments, poster and date, in a `WZS-status` folder. The file name carries the range and a timestamp. |
+| Downloads | Export WatZatSong sample statuses to TXT | Off | The same statuses as a readable text file, alongside the CSV in `WZS-status`. |
+| Downloads | Download WatZatSong user pictures | Off | Download each sample poster's profile picture into a `WZS-userpics` folder, keeping its real format. The Google or Facebook avatar is fetched when the profile links one; the default avatar is skipped. One picture per poster. |
+| Downloads | Download pakartot.lt cover art | Off | For each [pakartot.lt](#pakartotlt-albums-playlists-and-artists) album, save its cover image in a `pakartot-covers` folder next to the fingerprints, named after the artist and album. Only pakartot.lt links use it. |
 | Downloads | Skip items shorter than / longer than | 0 (no limit) | Leaves out items by length, in seconds and minutes. 60 seconds leaves out YouTube Shorts. |
 | Downloads | Skip items already fingerprinted in an earlier run | Off | See [Running a channel again](#running-a-channel-again). |
 | Downloads | Show every line of download output | Off | Adds everything yt-dlp and audfprint print to the console. Useful when a download fails; otherwise it floods the console. Locked while a job runs. |
@@ -375,6 +457,8 @@ Press **Check setup** first. It:
 | An install fails | The console shows why (no connection, proxy, antivirus) and how to do that part by hand. |
 | Many downloads fail, HTTP 429 or 403 | The site is rate-limiting you. After ten in a row the run pauses and resumes by itself later. Lower **Downloads at once**, or try again later. |
 | "YouTube asked to confirm you are not a bot" | YouTube is refusing this PC for a while. Choose your browser under **Sign in with cookies from** (Settings, Downloads), lower **Downloads at once**, or wait. |
+| WatZatSong samples all fail or are refused | The site needs a signed-in browser. Choose it under **Sign in with cookies from** (Settings, Downloads) and stay signed in there. If it still refuses, raise **Wait between WatZatSong samples**. The range counts as incomplete, so running it again fetches the rest. |
+| pakartot.lt finds no tracks | You are not signed in to pakartot.lt in the browser under **Sign in with cookies from** (Settings, Downloads). Sign in there (Firefox works most reliably), then run the link again. Only album and playlist pages are supported. |
 | "yt-dlp may be out of date" | A site changed and this yt-dlp has not caught up. Once the job has finished, press **Check setup** to update it, then run the link again. |
 | "audfprint could not read ..." | That file is damaged or cut off. It is left out of the fingerprints and not remembered as done, and its link counts as incomplete, so running the link again downloads it again. |
 | Some items are skipped | Private, members-only, age-restricted or blocked in your country. The console gives the reason for each, with yt-dlp's own error and up to three of its warnings under it. |

@@ -5,6 +5,51 @@ Versions follow [semantic versioning](https://semver.org/). Pre-releases
 
 ## [1.0.0-beta.9] - 2026-10-06
 
+### Added
+
+- **pakartot.lt albums, playlists and artist pages.** A `pakartot.lt/album/`,
+  `pakartot.lt/playlist/` or `pakartot.lt/project/` (artist) link is added
+  like any other link; the program reads the page, asks pakartot.lt's player
+  for the track list and downloads every track into the same split and
+  fingerprint pipeline. An artist page fetches every album on it, each as its
+  own album, into its own folder and its own `.pklz` named after the album's
+  artist and title. Every downloaded file is tagged with its title, artist and
+  album and carries the comment **Šaltinis: pakartot.lt**. The audio files
+  keep their real titles, Lithuanian or Russian letters and all (folder and
+  `.pklz` names stay plain ASCII). With **Download pakartot.lt cover art**
+  (Settings, Downloads) on, each album's cover is saved beside the
+  fingerprints in a `pakartot-covers` folder. The site needs a signed-in
+  browser, so it uses **Sign in with cookies from** (Settings, Downloads;
+  Firefox works most reliably); without it the link counts as incomplete, so
+  running it again fetches the tracks once signed in. Single-track pages are
+  not supported; add the album instead.
+- **WatZatSong sample ranges.** WatZatSong is not a yt-dlp site, so its
+  samples are added by their ID range instead of a link: fill in the new
+  **WatZatSong IDs** boxes in the toolbar (from one sample ID to another, or
+  one on its own) and press **Add range**. The range joins the list as a
+  single entry and runs through the same download, split and fingerprint
+  pipeline, into a `.pklz` named after the range. The samples are fetched one
+  at a time, with a wait set by the new **Wait between WatZatSong samples**
+  (Settings, Downloads; default 500 ms). The site needs a signed-in browser,
+  so it uses **Sign in with cookies from** (Settings, Downloads) like other
+  logged-in sites (Firefox works most reliably). Samples that no longer exist
+  are skipped; a range the site refuses counts as incomplete, so running it
+  again fetches the rest.
+- **Export WatZatSong comments.** With **Also export WatZatSong comments**
+  (Settings, Downloads) on, each sample that has comments gets a text file in
+  a `WZS-comments` folder beside the fingerprints: the time of each comment,
+  who wrote it and what they said. The files stay after the audio is deleted.
+- **Export WatZatSong sample statuses and user pictures.** Three more range
+  options (Settings, Downloads), all read from the same page the range
+  already fetches: **Export WatZatSong sample statuses to CSV** and
+  **...to TXT** write a record of every sample in the range (active, removed,
+  deleted or closed, with its proposals, comments, poster and date) to a
+  `WZS-status` folder, each file name carrying the range and a timestamp; and
+  **Download WatZatSong user pictures** saves each poster's profile picture to
+  a `WZS-userpics` folder in its real format (JPEG, PNG, GIF or WebP), fetching
+  the linked Google or Facebook avatar when there is one and skipping the
+  default avatar.
+
 ### Changed
 
 - **Settings opens where you last left it**, also after a restart, instead
